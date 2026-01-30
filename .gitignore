@@ -1,0 +1,15 @@
+# Environment
+node_modules/
+dist/
+*.log
+.env
+
+# Config (don't commit bot tokens)
+oh-my-telegram.json
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

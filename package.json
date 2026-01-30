@@ -1,0 +1,51 @@
+{
+  "name": "oh-my-telegram",
+  "version": "1.0.0",
+  "description": "Telegram interface for oh-my-opencode - Enables sisyphus to chat via Telegram",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "oh-my-telegram": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build",
+    "preinstall": "echo 'Installing oh-my-telegram...'"
+  },
+  "keywords": [
+    "opencode",
+    "oh-my-opencode",
+    "telegram",
+    "bot",
+    "sisyphus",
+    "ai",
+    "agent"
+  ],
+  "author": "eunoo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eunoo/oh-my-telegram"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "js-yaml": "^4.1.1",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

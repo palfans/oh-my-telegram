@@ -1,0 +1,13 @@
+{
+  "telegram": {
+    "botToken": "${TELEGRAM_BOT_TOKEN}",
+    "allowedUsers": ["${TELEGRAM_USER_ID}"],
+    "polling": true
+  },
+  "opencode": {
+    "defaultAgent": "sisyphus",
+    "workingDirectory": "/Users/eunoo/projects/daemons",
+    "sessionPrefix": "telegram-test",
+    "opencodePath": "opencode"
+  }
+}
