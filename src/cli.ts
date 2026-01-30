@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { Telegraf } from 'telegraf';
 import { config } from 'dotenv';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
@@ -45,7 +44,6 @@ async function main() {
 
   const config = loadConfig(resolve(configPath));
 
-  // Validate configuration
   if (!config.telegram.botToken) {
     console.error('❌ Error: TELEGRAM_BOT_TOKEN is required');
     console.error('Set it in oh-my-telegram.json or .env file');
@@ -56,38 +54,29 @@ async function main() {
     console.warn('⚠️  Warning: No allowed users configured. Anyone can use this bot!');
   }
 
-  // Create Telegram bot
-  const bot = new Telegraf(config.telegram.botToken);
-  const telegramBot = new TelegramBot(config);
+  const bot = new TelegramBot(config);
 
-  // Setup handlers
-  telegramBot.setupHandlers(bot);
+  await bot.initialize();
 
-  // Start bot (polling mode)
-  console.log('🚀 Starting oh-my-telegram...');
-  console.log(`📱 Default agent: ${config.opencode.defaultAgent}`);
-  console.log(`📁 Working directory: ${config.opencode.workingDirectory}`);
-
-  // Clear inactive sessions every hour
   setInterval(() => {
-    telegramBot.clearInactiveSessions();
+    bot.clearInactiveSessions();
   }, 60 * 60 * 1000);
 
-  // Launch bot
-  if (config.telegram.polling !== false) {
-    await bot.launch();
-    console.log('✅ Bot started (polling mode)');
-  } else {
-    console.log('📡 Webhook mode configured');
-    console.log(`Webhook URL: ${config.telegram.webhookUrl}`);
-  }
+  await bot.deleteWebhook();
 
-  // Graceful shutdown
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  await bot.start();
+
+  const shutdown = async (signal: string) => {
+    await bot.stop(signal);
+    process.exit(0);
+  };
+
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 main().catch(error => {
-  console.error('❌ Fatal error:', error);
+  const errorTime = new Date().toISOString();
+  console.error(`[${errorTime}] [bot] fatal error:`, error);
   process.exit(1);
 });

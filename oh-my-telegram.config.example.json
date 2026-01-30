@@ -1,0 +1,28 @@
+{
+  "telegram": {
+    "botToken": "8598173520:AAFOueWt-WkUrKqjj1sUO_oD0Un-t4RcbmI",
+    "allowedUsers": ["990198083"],
+    "polling": true,
+    "inlineKeyboards": {
+      "enabled": true,
+      "mainMenu": [
+        [
+          { text: "🤖 Sisyphus (코딩)", callback_data: "agent:sisyphus" },
+          { text:🔮 Oracle (분석)", callback_data: "agent:oracle" },
+          { text: 📋 Prometheus (계획)", callback_data: "agent:prometheus" }
+        ],
+        [
+          { text: "📚 Librarian (문서)", callback_data: "agent:librarian" },
+          { text: "🎯 Metis (사전계획)", callback_data: "agent:metis" },
+          { text: ℹ️  도움말", callback_data: "help" }
+        ]
+      ]
+    }
+  },
+  "opencode": {
+    "defaultAgent": "sisyphus",
+    "workingDirectory": "/Users/eunoo/projects/daemons",
+    "sessionPrefix": "telegram-omo",
+    "opencodePath": "opencode"
+  }
+}

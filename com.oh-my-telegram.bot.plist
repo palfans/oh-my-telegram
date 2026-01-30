@@ -4,56 +4,48 @@
   <dict>
     <key>Label</key>
     <string>com.oh-my-telegram.bot</string>
-    
+
     <key>Comment</key>
-    <string>oh-my-telegram - Telegram interface for oh-my-opencode</string>
-    
+    <string>oh-my-telegram - Telegram interface for oh-my-opencode (v1.0.0)</string>
+
     <key>RunAtLoad</key>
     <true/>
-    
+
     <key>KeepAlive</key>
     <true/>
-    
+
     <key>WorkingDirectory</key>
     <string>/Users/eunoo/projects/oh-my-telegram</string>
-    
+
     <key>ProgramArguments</key>
     <array>
       <string>/opt/homebrew/bin/node</string>
       <string>/Users/eunoo/projects/oh-my-telegram/dist/cli.js</string>
     </array>
-    
+
     <key>StandardOutPath</key>
-    <string>/Users/eunoo/projects/oh-my-telegram/bot.log</string>
-    
+    <string>/tmp/oh-my-telegram/bot.log</string>
+
     <key>StandardErrorPath</key>
-    <string>/Users/eunoo/projects/oh-my-telegram/bot-error.log</string>
-    
+    <string>/tmp/oh-my-telegram/bot-error.log</string>
+
     <key>EnvironmentVariables</key>
     <dict>
+      <key>HOME</key>
+      <string>/Users/eunoo</string>
       <key>PATH</key>
       <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+      <key>OH_MY_TELEGRAM_VERSION</key>
+      <string>1.0.0</string>
     </dict>
-    
+
     <key>ProcessType</key>
     <string>Interactive</string>
-    
-    <key>Nice</key>
-    <integer>1</integer>
-    
-    <key>SoftResourceLimits</key>
-    <dict>
-      <key>NumberOfFiles</key>
-      <integer>1024</integer>
-    </dict>
-    
+
     <key>ThrottleInterval</key>
-    <integer>5</integer>
-    
+    <integer>10</integer>
+
     <key>ExitTimeOut</key>
     <integer>300</integer>
-    
-    <key>RestartDelay</key>
-    <integer>5</integer>
   </dict>
 </plist>

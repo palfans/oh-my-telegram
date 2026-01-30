@@ -29,16 +29,20 @@
     "ai",
     "agent"
   ],
-  "author": "eunoo",
+  "author": "Eunoo Cho <chokman@knou.ac.kr>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/eunoo/oh-my-telegram"
+    "url": "git+https://github.com/ChoEunoo/oh-my-telegram.git"
   },
+  "bugs": {
+    "url": "https://github.com/ChoEunoo/oh-my-telegram/issues"
+  },
+  "homepage": "https://github.com/ChoEunoo/oh-my-telegram#readme",
   "dependencies": {
+    "axios": "^1.7.7",
     "dotenv": "^16.4.7",
-    "js-yaml": "^4.1.1",
-    "telegraf": "^4.16.3"
+    "js-yaml": "^4.1.1"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
