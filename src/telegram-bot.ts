@@ -146,12 +146,16 @@ export class TelegramBot {
   setupHandlers(bot: any): void {
     const allowedUsers = new Set(this.config.telegram.allowedUsers);
 
-    // Middleware: Check if user is allowed
     bot.use((ctx: Context, next: () => Promise<void>) => {
+      if (allowedUsers.has('*')) {
+        return next();
+      }
+      
       const userId = ctx.from?.id.toString();
       if (!userId || !allowedUsers.has(userId)) {
         return ctx.reply('⛔ You are not authorized to use this bot.');
       }
+      
       return next();
     });
 

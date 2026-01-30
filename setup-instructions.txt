@@ -1,0 +1,52 @@
+========================================
+  oh-my-telegram 봇 설정 가이드
+========================================
+
+📱 1단계: Telegram에서 새 봇 생성
+------------------------------------
+1. Telegram에서 @BotFather 검색
+2. /newbot 보내기
+3. 봇 이름 입력 (예: OhMySisyphus)
+4. 사용자 이름 입력 (예: oh_my_sisyphus_bot)
+   - 영문, 숫자, _ 만 사용
+   - 고유해야 함
+5. 봇 토큰 받기 (예: 1234567890:ABC...)
+
+💻 2단계: 터미널에서 설정
+------------------------------------
+cd /Users/eunoo/projects/oh-my-telegram
+
+.env 파일을 열어서:
+nano .env
+
+또는 VS Code로:
+code .env
+
+TELEGRAM_BOT_TOKEN=여기에_받은_봇_토큰_입력
+
+예시:
+TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+ALLOWED_USERS=*
+
+저장 후 종료 (nano에서: Ctrl+X, Y, Enter)
+
+🚀 3단계: 봇 시작
+------------------------------------
+node dist/cli.js
+
+또는 백그라운드로 실행:
+nohup node dist/cli.js > bot.log 2>&1 &
+
+💬 4단계: 텔레그램에서 테스트
+------------------------------------
+1. 새로 만든 봇을 검색
+2. /start 보내기
+3. /sisyphus 안녕!
+4. /oracle explain how this works
+
+🛑 봇 중지方法:
+------------------------------------
+Ctrl+C (포그라운드 실행 중)
+또는
+pkill -f "node dist/cli.js"
+========================================
