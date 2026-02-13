@@ -40,8 +40,10 @@
   },
   "homepage": "https://github.com/ChoEunoo/oh-my-telegram#readme",
   "dependencies": {
+    "@opencode-ai/sdk": "^1.1.65",
     "axios": "^1.7.7",
     "dotenv": "^16.4.7",
+    "https-proxy-agent": "^7.0.6",
     "js-yaml": "^4.1.1"
   },
   "devDependencies": {

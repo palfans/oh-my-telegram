@@ -131,7 +131,7 @@ export class OpencodeGateway {
     this.sessionId = createResult.data.id;
     console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
 
-    return this.sessionId;
+    return this.sessionId!;
   }
 
   async listSessions(): Promise<Array<{ id: string; title?: string; updated?: number }>> {
