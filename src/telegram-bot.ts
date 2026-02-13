@@ -44,6 +44,7 @@ interface TelegramSession {
   chatId: number;
   opencodeSessionId: string;
   currentAgent: string;
+  workingDirectory: string;
   createdAt: Date;
   lastActivity: Date;
 }
@@ -205,6 +206,7 @@ export class TelegramBot {
         chatId,
         opencodeSessionId,
         currentAgent: this.config.opencode.defaultAgent,
+        workingDirectory: this.config.opencode.workingDirectory,
         createdAt: new Date(),
         lastActivity: new Date(),
       };
@@ -249,7 +251,12 @@ export class TelegramBot {
     session: TelegramSession,
     agent?: string
   ): Promise<string> {
-    return this.gateway.sendMessage(message);
+    // Prepend working directory context if not default
+    const contextMessage = session.workingDirectory !== this.config.opencode.workingDirectory
+      ? `[Working in: ${session.workingDirectory}]\n\n${message}`
+      : message;
+    
+    return this.gateway.sendMessage(contextMessage);
   }
 
   /**
@@ -325,6 +332,7 @@ export class TelegramBot {
       '/new - Create new session\n' +
       '/list - List all sessions\n' +
       '/switch <number> - Switch to session by number\n' +
+      '/cd [path] - Show/change working directory\n' +
       '/reset - Clear conversation history\n\n' +
       'Web UI: http://127.0.0.1:55986/\n\n' +
       'Or just send a message to use the default agent.',
@@ -351,6 +359,7 @@ export class TelegramBot {
       '/new - Create new session\n' +
       '/list - List all sessions\n' +
       '/switch <number> - Switch to session by number\n' +
+      '/cd [path] - Show/change working directory\n' +
       '/reset - Clear conversation history\n\n' +
       'Web UI:\n' +
       'opencode web: http://127.0.0.1:55986/\n\n' +
@@ -387,6 +396,7 @@ export class TelegramBot {
       '📊 *Bot Status*\n\n' +
       `*Session:* \`${sessionId}\`\n` +
       `*Agent:* ${session.currentAgent}\n` +
+      `*Working Dir:* \`${session.workingDirectory}\`\n` +
       `*Gateway:* ${gatewayStatus}\n` +
       `*Uptime:* ${uptimeFormatted}\n` +
       `*Active chats:* ${this.sessions.size}\n\n` +
@@ -482,6 +492,32 @@ export class TelegramBot {
       const errorMsg = `❌ Failed to switch session: ${error instanceof Error ? error.message : 'Unknown error'}`;
       await this.sendMessage(chatId, errorMsg);
     }
+  }
+
+  private async handleCd(chatId: number, path?: string): Promise<void> {
+    const session = this.getSession(chatId);
+
+    if (!path || path.trim() === '') {
+      // Show current working directory
+      await this.sendMessage(
+        chatId,
+        `📁 *Current Working Directory*\n\n` +
+        `\`${session.workingDirectory}\`\n\n` +
+        `Use \`/cd <path>\` to change directory.`
+      );
+      return;
+    }
+
+    // Change working directory
+    const newPath = path.startsWith('/') ? path : `${session.workingDirectory}/${path}`;
+    session.workingDirectory = newPath;
+
+    await this.sendMessage(
+      chatId,
+      `✅ *Working directory changed*\n\n` +
+      `New path: \`${newPath}\`\n\n` +
+      `All subsequent operations will use this directory.`
+    );
   }
 
   /**
@@ -588,6 +624,11 @@ export class TelegramBot {
     if (text.startsWith('/switch ')) {
       const sessionId = text.substring(8).trim();
       return this.handleSwitch(chatId, sessionId);
+    }
+
+    if (text === '/cd' || text.startsWith('/cd ')) {
+      const path = text.substring(3).trim();
+      return this.handleCd(chatId, path || undefined);
     }
 
     const session = this.getSession(chatId);
