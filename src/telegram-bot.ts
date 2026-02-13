@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 import { OpencodeGateway } from './opencode-gateway.js';
 
@@ -112,9 +113,21 @@ export class TelegramBot {
    * Make API call to Telegram
    */
   private async apiCall(method: string, payload: any = {}): Promise<any> {
-    const response = await axios.post(`${this.apiUrl}/${method}`, payload, {
+    // Configure proxy from environment variables if available
+    const axiosConfig: any = {
       timeout: method === 'getUpdates' ? 35000 : 30000,
-    });
+    };
+    
+    const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+    const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
+    const proxyUrl = httpsProxy || httpProxy;
+    
+    if (proxyUrl) {
+      axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
+      axiosConfig.proxy = false; // Disable axios built-in proxy when using custom agent
+    }
+
+    const response = await axios.post(`${this.apiUrl}/${method}`, payload, axiosConfig);
     return response.data;
   }
 
