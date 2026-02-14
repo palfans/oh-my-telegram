@@ -140,6 +140,47 @@ export class TelegramBot {
     
   }
 
+  private isOpencodeConnectivityError(error: unknown): boolean {
+    const msg = error instanceof Error ? error.message : String(error);
+
+    if (
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('fetch failed') ||
+      msg.includes('UND_ERR_HEADERS_TIMEOUT') ||
+      msg.includes('Headers Timeout') ||
+      msg.includes('socket hang up') ||
+      msg.includes('EHOSTUNREACH') ||
+      msg.includes('ENOTFOUND')
+    ) {
+      return true;
+    }
+
+    const anyErr = error as any;
+    const causeCode = anyErr?.cause?.code;
+    if (typeof causeCode === 'string' && (causeCode.includes('UND_') || causeCode.includes('ECONN'))) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private formatOpencodeUnavailableMessage(session: TelegramSession, error: unknown): string {
+    const serverUrl = this.serverUrl;
+    const dir = session.workingDirectory;
+    const errText = error instanceof Error ? error.message : String(error);
+
+    return (
+      `❌ OpenCode 服务不可用，无法执行本次请求。\n\n` +
+      `服务地址：${serverUrl}\n` +
+      `目录：${dir}\n\n` +
+      `建议：\n` +
+      `1) 在运行环境执行：./run-npx-minimal.sh\n` +
+      `2) 查看日志：bot.log / opencode-server.log / watchdog.log\n` +
+      `3) 如使用 tmux：tmux attach -t omo-telegram\n\n` +
+      `错误摘要：${errText}`
+    );
+  }
+
   /**
    * Make API call to Telegram
    */
@@ -810,7 +851,17 @@ export class TelegramBot {
     const session = this.getSession(chatId);
     await this.ensureOpencodeSession(session);
     const sessionId = session.gateway.getSessionId();
-    const gatewayStatus = '✅ Connected';
+    let gatewayStatus = '✅ Connected';
+    try {
+      const health = await session.gateway.getServerHealth();
+      gatewayStatus = `✅ Healthy (v${health.version})`;
+    } catch (error) {
+      if (this.isOpencodeConnectivityError(error)) {
+        gatewayStatus = '❌ Unreachable';
+      } else {
+        gatewayStatus = '⚠️ Unhealthy';
+      }
+    }
 
     const uptime = process.uptime();
     const uptimeFormatted = formatUptime(uptime);
@@ -1400,9 +1451,14 @@ export class TelegramBot {
         await task.complete('✅ 已完成');
         console.log(`[${timestamp}] [bot] response sent (${msgCount} messages, ${response.length} chars)`);
       } catch (error: any) {
-        const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
         console.error(`[${timestamp}] [bot] execution error:`, error);
-        await this.sendMessage(chatId, errorMsg);
+
+        if (this.isOpencodeConnectivityError(error)) {
+          await this.sendMessage(chatId, this.formatOpencodeUnavailableMessage(session, error));
+        } else {
+          const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+          await this.sendMessage(chatId, errorMsg);
+        }
         await task.fail('❌ 失败');
         await this.maybeSendPendingInteractions(chatId);
       } finally {

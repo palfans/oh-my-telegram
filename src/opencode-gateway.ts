@@ -429,6 +429,15 @@ export class OpencodeGateway {
     return (result.data || []) as unknown as PendingPermission[];
   }
 
+  async getServerHealth(): Promise<{ healthy: boolean; version: string }> {
+    const result = await this.clientV2.global.health();
+    if (result.error || !result.data) {
+      throw new Error(`Global health check failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return result.data as any;
+  }
+
   async replyPermission(requestID: string, reply: 'once' | 'always' | 'reject', message?: string): Promise<void> {
     const result = await this.clientV2.permission.reply({
       requestID,
