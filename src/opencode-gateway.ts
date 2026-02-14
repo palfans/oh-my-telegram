@@ -146,7 +146,19 @@ export class OpencodeGateway {
     return this.sessionId!;
   }
 
-  async listSessions(): Promise<Array<{ id: string; title?: string; updated?: number }>> {
+  async getSessionInfo(sessionId: string): Promise<any> {
+    const result = await this.client.session.get({
+      path: { id: sessionId },
+    });
+
+    if (result.error || !result.data) {
+      throw new Error(`Session get failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return result.data as any;
+  }
+
+  async listSessions(): Promise<Array<{ id: string; title?: string; updated?: number; projectID?: string }>> {
     console.log('[OpencodeGateway] Listing sessions...');
 
     const sessionsResult = await this.client.session.list();
@@ -161,6 +173,7 @@ export class OpencodeGateway {
       id: s.id,
       title: s.title,
       updated: s.updated,
+      projectID: s.projectID,
     }));
   }
 

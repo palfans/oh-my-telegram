@@ -160,6 +160,13 @@ export class TelegramBot {
     return raw.replace(/\/+$/, '');
   }
 
+  private buildOpencodeSessionWebUrl(sessionId: string, projectID?: string): string {
+    const base = this.getOpencodeWebUrl();
+    const project = encodeURIComponent(projectID || 'global');
+    const id = encodeURIComponent(sessionId);
+    return `${base}/${project}/session/${id}`;
+  }
+
   /**
    * Send message to Telegram chat
    */
@@ -449,13 +456,22 @@ export class TelegramBot {
   private async handleNew(chatId: number): Promise<void> {
     try {
       const newSessionId = await this.gateway.createNewSession();
-      const webUrl = this.getOpencodeWebUrl();
+      let projectID: string | undefined;
+      try {
+        const info = await this.gateway.getSessionInfo(newSessionId);
+        projectID = info?.projectID;
+      } catch {
+        projectID = undefined;
+      }
+
+      const sessionUrl = this.buildOpencodeSessionWebUrl(newSessionId, projectID);
+
       await this.sendMarkdownMessage(
         chatId,
         `✅ *New session created*\n\n` +
         `Session ID: \`${newSessionId}\`\n\n` +
         `View in opencode web:\n` +
-        `${webUrl}/session/${newSessionId}\n\n` +
+        `${sessionUrl}\n\n` +
         `Starting fresh conversation.`
       );
     } catch (error: any) {
@@ -522,7 +538,7 @@ export class TelegramBot {
       const targetSession = sessions[num - 1];
       await this.gateway.switchSession(targetSession.id);
 
-      const webUrl = this.getOpencodeWebUrl();
+      const sessionUrl = this.buildOpencodeSessionWebUrl(targetSession.id, targetSession.projectID);
       await this.sendMessage(
         chatId,
         `Switched to session\n\n` +
@@ -530,7 +546,7 @@ export class TelegramBot {
         `Title: ${targetSession.title || 'Untitled'}\n` +
         `Session ID: ${targetSession.id}\n\n` +
         `View in opencode web:\n` +
-        `${webUrl}/session/${targetSession.id}`
+        `${sessionUrl}`
       );
     } catch (error: any) {
       const errorMsg = `❌ Failed to switch session: ${error instanceof Error ? error.message : 'Unknown error'}`;
