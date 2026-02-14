@@ -2,7 +2,7 @@ import axios, { type AxiosInstance } from 'axios';
 import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
-import { OpencodeGateway } from './opencode-gateway.js';
+import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest } from './opencode-gateway.js';
 
 /**
  * Telegram update structure
@@ -46,6 +46,7 @@ interface TelegramSession {
   opencodeSessionId: string;
   currentAgent: string;
   workingDirectory: string;
+  lastUserMessage?: string;
   createdAt: Date;
   lastActivity: Date;
 }
@@ -96,6 +97,11 @@ export class TelegramBot {
   private botToken: string;
   private apiUrl: string;
   private httpClient: AxiosInstance;
+  private seenPermissionRequestIds: Set<string> = new Set();
+  private seenQuestionRequestIds: Set<string> = new Set();
+  private questionAnswerState: Map<string, { answers: Array<Array<string>>; total: number }> = new Map();
+
+  private inFlightByChatId: Map<number, boolean> = new Map();
   private isRunning: boolean = false;
   private pollingInterval: number = 1000; // ms between polling attempts
   private longPollTimeout: number = 30; // seconds for long polling
@@ -315,11 +321,37 @@ export class TelegramBot {
     let current = '';
 
     for (const line of text.split('\n')) {
-      if ((current + line + '\n').length > maxLength) {
-        if (current) chunks.push(current);
-        current = line + '\n';
-      } else {
-        current += line + '\n';
+      let remaining = line;
+
+      while (remaining.length > 0) {
+        const prefix = current;
+        const suffixNewline = '\n';
+
+        const spaceLeft = maxLength - (prefix.length + suffixNewline.length);
+        if (spaceLeft <= 0) {
+          if (current) chunks.push(current);
+          current = '';
+          continue;
+        }
+
+        const take = Math.min(spaceLeft, remaining.length);
+        const part = remaining.slice(0, take);
+        remaining = remaining.slice(take);
+
+        if ((current + part + '\n').length > maxLength) {
+          if (current) chunks.push(current);
+          current = '';
+          continue;
+        }
+
+        current += part;
+
+        if (remaining.length === 0) {
+          current += '\n';
+        } else {
+          chunks.push(current);
+          current = '';
+        }
       }
     }
 
@@ -381,7 +413,8 @@ export class TelegramBot {
       '/list - List all sessions\n' +
       '/switch <number> - Switch to session by number\n' +
       '/cd [path] - Show/change working directory\n' +
-      '/reset - Clear conversation history\n\n' +
+      '/reset - Delete session group (like TUI ctrl-d)\n' +
+      '/reset-agent - Reset current child agent session\n\n' +
       `Web UI: ${this.getOpencodeWebUrl()}/\n\n` +
       'Or just send a message to use the default agent.',
       replyMarkup
@@ -408,7 +441,8 @@ export class TelegramBot {
       '/list - List all sessions\n' +
       '/switch <number> - Switch to session by number\n' +
       '/cd [path] - Show/change working directory\n' +
-      '/reset - Clear conversation history\n\n' +
+      '/reset - Delete session group (like TUI ctrl-d)\n' +
+      '/reset-agent - Reset current child agent session\n\n' +
       'Web UI:\n' +
       `opencode web: ${this.getOpencodeWebUrl()}/\n\n` +
       'Example:\n' +
@@ -418,17 +452,44 @@ export class TelegramBot {
   }
 
   private async handleReset(chatId: number): Promise<void> {
-    const oldSessionId = this.gateway.getSessionId();
-    await this.gateway.resetSession();
-    const newSessionId = this.gateway.getSessionId();
+    try {
+      const before = this.gateway.getSessionId();
+      const result = await this.gateway.resetSessionGroup();
+      const after = this.gateway.getSessionId();
 
-    await this.sendMarkdownMessage(
-      chatId,
-      `✅ *Conversation history cleared*\n\n` +
-      `Old session: \`${oldSessionId || 'none'}\`\n` +
-      `New session: \`${newSessionId}\`\n\n` +
-      `Starting fresh conversation.`
-    );
+      await this.sendMarkdownMessage(
+        chatId,
+        `✅ *Session group deleted*\n\n` +
+        `Before: \`${before || 'none'}\`\n` +
+        `Root: \`${result.rootSessionID || 'unknown'}\`\n` +
+        `Deleted: \`${result.deletedCount}\`\n` +
+        `New: \`${after || result.newSessionID}\`\n\n` +
+        `Starting fresh conversation.`
+      );
+    } catch (error: any) {
+      const msg = `❌ Reset failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
+      await this.sendMessage(chatId, msg);
+    }
+  }
+
+  private async handleResetAgent(chatId: number): Promise<void> {
+    try {
+      const before = this.gateway.getSessionId();
+      const result = await this.gateway.resetCurrentChildSession();
+      const after = this.gateway.getSessionId();
+
+      await this.sendMarkdownMessage(
+        chatId,
+        `✅ *Agent session reset*\n\n` +
+        `Deleted: \`${result.deletedSessionID}\`\n` +
+        `Parent: \`${result.parentSessionID}\`\n` +
+        `Current: \`${after || 'unknown'}\`\n\n` +
+        `Previous: \`${before || 'none'}\``
+      );
+    } catch (error: any) {
+      const msg = `❌ Reset-agent failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
+      await this.sendMessage(chatId, msg);
+    }
   }
 
   private async handleStatus(chatId: number): Promise<void> {
@@ -482,7 +543,7 @@ export class TelegramBot {
 
   private async handleList(chatId: number): Promise<void> {
     try {
-      const sessions = await this.gateway.listSessions();
+      const sessions = await this.gateway.listRootSessions(50);
       const currentSessionId = this.gateway.getSessionId();
 
       if (sessions.length === 0) {
@@ -500,12 +561,16 @@ export class TelegramBot {
         .join('\n\n');
 
       const webUrl = this.getOpencodeWebUrl();
-      await this.sendMessage(
-        chatId,
-        `Sessions (${sessions.length} total)\n\n${sessionList}\n\n` +
+
+      const message =
+        `Root sessions (${sessions.length} shown)\n\n${sessionList}\n\n` +
         `Use /switch <number> to switch sessions\n` +
-        `View in opencode web: ${webUrl}/`
-      );
+        `View in opencode web: ${webUrl}/`;
+
+      const chunks = this.chunkMessage(message);
+      for (const chunk of chunks) {
+        await this.sendMessage(chatId, chunk);
+      }
     } catch (error: any) {
       const errorMsg = `❌ Failed to list sessions: ${error instanceof Error ? error.message : 'Unknown error'}`;
       await this.sendMessage(chatId, errorMsg);
@@ -525,7 +590,7 @@ export class TelegramBot {
     }
 
     try {
-      const sessions = await this.gateway.listSessions();
+      const sessions = await this.gateway.listRootSessions(50);
 
       if (num < 1 || num > sessions.length) {
         await this.sendMessage(
@@ -581,6 +646,125 @@ export class TelegramBot {
     );
   }
 
+  private formatPermissionRequestText(permission: PendingPermission): string {
+    const patterns = permission.patterns || [];
+    const patternsPreview = patterns.slice(0, 10);
+    const remaining = patterns.length - patternsPreview.length;
+
+    const lines: string[] = [];
+    lines.push('⚠️ OpenCode 需要你的授权才能继续执行：');
+    lines.push('');
+    lines.push(`权限类型: ${permission.permission}`);
+
+    if (patternsPreview.length > 0) {
+      lines.push('影响范围:');
+      for (const p of patternsPreview) lines.push(`- ${p}`);
+      if (remaining > 0) lines.push(`- ... 以及另外 ${remaining} 项`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private buildPermissionInlineKeyboard(requestID: string) {
+    return {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ 允许一次', callback_data: `perm:once:${requestID}` },
+            { text: '✅ 总是允许', callback_data: `perm:always:${requestID}` },
+          ],
+          [
+            { text: '❌ 拒绝', callback_data: `perm:reject:${requestID}` },
+            { text: '🔁 重试上一条', callback_data: `perm:retry:${requestID}` },
+          ],
+        ],
+      },
+    };
+  }
+
+  private formatQuestionText(req: PendingQuestionRequest, questionIndex: number): string {
+    const q = req.questions[questionIndex];
+    const lines: string[] = [];
+    lines.push('❓ OpenCode 需要你选择后才能继续：');
+    lines.push('');
+    lines.push(`${q.header}`);
+    lines.push(q.question);
+    return lines.join('\n');
+  }
+
+  private buildQuestionInlineKeyboard(requestID: string, questionIndex: number, options: PendingQuestionRequest['questions'][number]['options']) {
+    const rows = options.map((opt, i) => [
+      { text: opt.label, callback_data: `q:ans:${requestID}:${questionIndex}:${i}` },
+    ]);
+
+    rows.push([
+      { text: '❌ 取消', callback_data: `q:reject:${requestID}` },
+    ]);
+
+    return {
+      reply_markup: {
+        inline_keyboard: rows,
+      },
+    };
+  }
+
+  private async maybeSendPendingQuestions(chatId: number): Promise<void> {
+    const currentSessionId = this.gateway.getSessionId();
+    if (!currentSessionId) return;
+
+    let pending: PendingQuestionRequest[];
+    try {
+      pending = await this.gateway.listPendingQuestions();
+    } catch (error) {
+      console.warn('[bot] failed to list pending questions:', error);
+      return;
+    }
+
+    const relevant = pending
+      .filter(q => q.sessionID === currentSessionId)
+      .filter(q => !this.seenQuestionRequestIds.has(q.id));
+
+    for (const req of relevant) {
+      this.seenQuestionRequestIds.add(req.id);
+      if (!req.questions || req.questions.length === 0) continue;
+      this.questionAnswerState.set(req.id, {
+        answers: Array.from({ length: req.questions.length }, () => [] as string[]),
+        total: req.questions.length,
+      });
+
+      const text = this.formatQuestionText(req, 0);
+      await this.sendMessage(chatId, text, this.buildQuestionInlineKeyboard(req.id, 0, req.questions[0].options || []));
+    }
+  }
+
+  private async maybeSendPendingInteractions(chatId: number): Promise<void> {
+    await this.maybeSendPendingQuestions(chatId);
+    await this.maybeSendPendingPermissions(chatId);
+  }
+
+  private async maybeSendPendingPermissions(chatId: number): Promise<void> {
+    const currentSessionId = this.gateway.getSessionId();
+    if (!currentSessionId) return;
+
+    let pending: PendingPermission[];
+    try {
+      pending = await this.gateway.listPendingPermissions();
+    } catch (error) {
+      console.warn('[bot] failed to list pending permissions:', error);
+      return;
+    }
+
+    const relevant = pending
+      .filter(p => p.sessionID === currentSessionId)
+      .filter(p => !this.seenPermissionRequestIds.has(p.id));
+
+    for (const req of relevant) {
+      this.seenPermissionRequestIds.add(req.id);
+      const text = this.formatPermissionRequestText(req);
+      await this.sendMessage(chatId, text, this.buildPermissionInlineKeyboard(req.id));
+    }
+  }
+
   /**
    * Handle callback query (inline keyboard button press)
    */
@@ -599,6 +783,116 @@ export class TelegramBot {
     }
 
     await this.answerCallbackQuery(id);
+
+    const qMatch = data.match(/^q:(ans|reject):([^:]+)(?::(\d+):(\d+))?$/);
+    if (qMatch) {
+      const [, action, requestID, qIndexRaw, oIndexRaw] = qMatch;
+      const timestamp = new Date().toISOString();
+
+      try {
+        if (action === 'reject') {
+          await this.gateway.rejectQuestion(requestID);
+          if (message?.message_id) {
+            await this.deleteMessage(chatId, message.message_id);
+          }
+          await this.sendMessage(chatId, '已取消选择，请重新发送你的请求。');
+          return;
+        }
+
+        const questionIndex = Number(qIndexRaw);
+        const optionIndex = Number(oIndexRaw);
+        if (!Number.isFinite(questionIndex) || !Number.isFinite(optionIndex)) {
+          await this.sendMessage(chatId, '⚠️ 无效的选择。');
+          return;
+        }
+
+        const pending = await this.gateway.listPendingQuestions();
+        const req = pending.find(r => r.id === requestID);
+        if (!req) {
+          await this.sendMessage(chatId, '⚠️ 该问题已不存在（可能已超时或已被处理）。请重试你的请求。');
+          return;
+        }
+
+        const q = req.questions?.[questionIndex];
+        const opt = q?.options?.[optionIndex];
+        if (!q || !opt) {
+          await this.sendMessage(chatId, '⚠️ 该选项无效。');
+          return;
+        }
+
+        const state = this.questionAnswerState.get(requestID) || {
+          answers: Array.from({ length: req.questions.length }, () => [] as string[]),
+          total: req.questions.length,
+        };
+
+        state.answers[questionIndex] = [opt.label];
+        this.questionAnswerState.set(requestID, state);
+
+        if (message?.message_id) {
+          await this.deleteMessage(chatId, message.message_id);
+        }
+
+        const nextIndex = questionIndex + 1;
+        if (nextIndex < state.total) {
+          const nextQ = req.questions[nextIndex];
+          const nextText = this.formatQuestionText(req, nextIndex);
+          await this.sendMessage(chatId, nextText, this.buildQuestionInlineKeyboard(requestID, nextIndex, nextQ.options || []));
+          return;
+        }
+
+        await this.gateway.replyQuestion(requestID, state.answers);
+        this.questionAnswerState.delete(requestID);
+
+        console.log(`[${timestamp}] [bot] question replied: ${requestID}`);
+        await this.sendMessage(chatId, '✅ 已提交选择，继续处理中…');
+        await this.maybeSendPendingInteractions(chatId);
+      } catch (error: any) {
+        console.error(`[${timestamp}] [bot] question reply error:`, error);
+        await this.sendMessage(chatId, `❌ 提交选择失败：${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      return;
+    }
+
+    const permMatch = data.match(/^perm:(once|always|reject|retry):(.+)$/);
+    if (permMatch) {
+      const [, action, requestID] = permMatch;
+      const session = this.getSession(chatId);
+      const timestamp = new Date().toISOString();
+
+      if (action === 'retry') {
+        if (!session.lastUserMessage) {
+          await this.sendMessage(chatId, '⚠️ 没有可重试的上一条消息。请重新发送你的请求。');
+          return;
+        }
+
+        if (message?.message_id) {
+          await this.deleteMessage(chatId, message.message_id);
+        }
+
+        this.startOpenCodeExecution(chatId, session.lastUserMessage, session, undefined);
+
+        return;
+      }
+
+      const reply = action === 'once' ? 'once' : action === 'always' ? 'always' : 'reject';
+
+      try {
+        await this.gateway.replyPermission(requestID, reply, `telegram_user=${userId}`);
+        console.log(`[${timestamp}] [bot] permission replied: ${requestID} -> ${reply}`);
+
+        if (message?.message_id) {
+          await this.deleteMessage(chatId, message.message_id);
+        }
+
+        await this.sendMessage(chatId, `✅ 已提交授权：${reply}。如果操作没有自动继续，请点击“重试上一条”或重新发送请求。`);
+      } catch (error: any) {
+        console.error(`[${timestamp}] [bot] permission reply error:`, error);
+        await this.sendMessage(chatId, `❌ 授权失败：${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+
+      return;
+    }
 
     const match = data.match(/^(agent|action):(.+)$/);
     if (!match) return;
@@ -670,6 +964,10 @@ export class TelegramBot {
       return this.handleReset(chatId);
     }
 
+    if (text === '/reset-agent' || text.startsWith('/reset-agent ')) {
+      return this.handleResetAgent(chatId);
+    }
+
     if (text === '/status' || text.startsWith('/status ')) {
       return this.handleStatus(chatId);
     }
@@ -707,26 +1005,45 @@ export class TelegramBot {
     }
 
     console.log(`[${timestamp}] [bot] user ${userId} (agent: ${session.currentAgent}): ${messageContent.substring(0, 50)}...`);
+    session.lastUserMessage = messageContent;
 
-    try {
-      const response = await this.executeOpenCode(
-        messageContent,
-        session,
-        agent || undefined
-      );
+    this.startOpenCodeExecution(chatId, messageContent, session, agent || undefined);
+  }
 
-      const chunks = this.chunkMessage(response);
-
-      for (const chunk of chunks) {
-        await this.sendMessage(chatId, chunk);
-      }
-
-      console.log(`[${timestamp}] [bot] response sent (${chunks.length} chunks, ${response.length} chars)`);
-    } catch (error: any) {
-      const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
-      console.error(`[${timestamp}] [bot] execution error:`, error);
-      await this.sendMessage(chatId, errorMsg);
+  private startOpenCodeExecution(chatId: number, messageContent: string, session: TelegramSession, agent?: string): void {
+    if (this.inFlightByChatId.get(chatId)) {
+      void this.sendMessage(chatId, '⏳ 正在处理上一条请求，请稍后或等待按钮提示。');
+      return;
     }
+
+    this.inFlightByChatId.set(chatId, true);
+
+    const pollIntervalMs = 1000;
+    const poller = setInterval(() => {
+      void this.maybeSendPendingInteractions(chatId);
+    }, pollIntervalMs);
+
+    void (async () => {
+      const timestamp = new Date().toISOString();
+      try {
+        await this.maybeSendPendingInteractions(chatId);
+        const response = await this.executeOpenCode(messageContent, session, agent);
+        await this.maybeSendPendingInteractions(chatId);
+        const chunks = this.chunkMessage(response);
+        for (const chunk of chunks) {
+          await this.sendMessage(chatId, chunk);
+        }
+        console.log(`[${timestamp}] [bot] response sent (${chunks.length} chunks, ${response.length} chars)`);
+      } catch (error: any) {
+        const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        console.error(`[${timestamp}] [bot] execution error:`, error);
+        await this.sendMessage(chatId, errorMsg);
+        await this.maybeSendPendingInteractions(chatId);
+      } finally {
+        clearInterval(poller);
+        this.inFlightByChatId.delete(chatId);
+      }
+    })();
   }
 
   /**
