@@ -43,9 +43,11 @@ interface TelegramUpdate {
  */
 interface TelegramSession {
   chatId: number;
-  opencodeSessionId: string;
+  sessionKey: string;
+  opencodeSessionId: string | null;
   currentAgent: string;
   workingDirectory: string;
+  gateway: OpencodeGateway;
   lastUserMessage?: string;
   createdAt: Date;
   lastActivity: Date;
@@ -91,9 +93,9 @@ export interface OhMyTelegramConfig {
  * Using direct API calls (no Telegraf) - clawdbot-compatible architecture
  */
 export class TelegramBot {
-  private gateway: OpencodeGateway;
   private config: OhMyTelegramConfig;
   private sessions: Map<number, TelegramSession>;
+  private serverUrl: string;
   private botToken: string;
   private apiUrl: string;
   private httpClient: AxiosInstance;
@@ -111,13 +113,13 @@ export class TelegramBot {
     this.config = config;
     this.botToken = config.telegram.botToken;
     this.apiUrl = `https://api.telegram.org/bot${this.botToken}`;
-    this.gateway = new OpencodeGateway('http://localhost:4096', config.opencode.workingDirectory);
+    this.serverUrl = 'http://localhost:4096';
     this.sessions = new Map();
     this.httpClient = this.createTelegramHttpClient();
   }
 
   async initialize(): Promise<void> {
-    await this.gateway.initialize();
+    
   }
 
   /**
@@ -205,6 +207,250 @@ export class TelegramBot {
     });
   }
 
+  private async sendHtmlMessage(chatId: number, text: string, options: any = {}): Promise<void> {
+    const { parse_mode, ...rest } = options;
+    return this.sendMessage(chatId, text, {
+      ...rest,
+      parse_mode: parse_mode ?? 'HTML',
+    });
+  }
+
+  private escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  private escapeHtmlAttribute(text: string): string {
+    return this.escapeHtml(text);
+  }
+
+  private chunkRawForHtmlWrapper(
+    raw: string,
+    wrapPrefix: string,
+    wrapSuffix: string,
+    maxPayloadLength = 4000
+  ): string[] {
+    const chunks: string[] = [];
+    let remaining = raw;
+
+    while (remaining.length > 0) {
+      let lo = 1;
+      let hi = remaining.length;
+      let best = 0;
+
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const candidate = remaining.slice(0, mid);
+        const formatted = wrapPrefix + this.escapeHtml(candidate) + wrapSuffix;
+        if (formatted.length <= maxPayloadLength) {
+          best = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+
+      if (best <= 0) best = 1;
+
+      let cut = best;
+      const nl = remaining.lastIndexOf('\n', best - 1);
+      if (nl !== -1) {
+        const candidateNl = remaining.slice(0, nl + 1);
+        const formattedNl = wrapPrefix + this.escapeHtml(candidateNl) + wrapSuffix;
+        if (formattedNl.length <= maxPayloadLength) {
+          cut = nl + 1;
+        }
+      }
+
+      chunks.push(remaining.slice(0, cut));
+      remaining = remaining.slice(cut);
+    }
+
+    return chunks;
+  }
+
+  private formatPreHtml(raw: string): string {
+    return `<pre>${this.escapeHtml(raw)}</pre>`;
+  }
+
+  private chunkRawForHtmlPre(raw: string, maxPayloadLength = 4000): string[] {
+    return this.chunkRawForHtmlWrapper(raw, '<pre>', '</pre>', maxPayloadLength);
+  }
+
+  private async sendPreMessage(chatId: number, raw: string, options: any = {}): Promise<number> {
+    const chunks = this.chunkRawForHtmlPre(raw);
+    for (const chunk of chunks) {
+      await this.sendHtmlMessage(chatId, this.formatPreHtml(chunk), options);
+    }
+
+    return chunks.length;
+  }
+
+  private parseMarkdownCodeBlocks(markdown: string): Array<
+    | { kind: 'code'; lang?: string; raw: string }
+    | { kind: 'text'; raw: string }
+  > {
+    const lines = markdown.split('\n');
+    const blocks: Array<{ kind: 'code'; lang?: string; raw: string } | { kind: 'text'; raw: string }> = [];
+
+    let inCode = false;
+    let codeLang: string | undefined;
+    let buf: string[] = [];
+
+    const flushText = () => {
+      const raw = buf.join('\n');
+      buf = [];
+      if (raw !== '') blocks.push({ kind: 'text', raw });
+    };
+
+    const flushCode = () => {
+      const raw = buf.join('\n');
+      buf = [];
+      blocks.push({ kind: 'code', lang: codeLang, raw });
+    };
+
+    for (const line of lines) {
+      const fence = line.match(/^```\s*(\S+)?\s*$/);
+      if (fence) {
+        if (!inCode) {
+          flushText();
+          inCode = true;
+          codeLang = fence[1] || undefined;
+        } else {
+          inCode = false;
+          flushCode();
+          codeLang = undefined;
+        }
+        continue;
+      }
+
+      buf.push(line);
+    }
+
+    if (buf.length > 0) {
+      if (inCode) flushCode();
+      else flushText();
+    }
+
+    return blocks;
+  }
+
+  private formatInlineMarkdownToHtml(text: string): string {
+    let out = '';
+    let i = 0;
+
+    while (i < text.length) {
+      if (text[i] === '`') {
+        const end = text.indexOf('`', i + 1);
+        if (end !== -1) {
+          const raw = text.slice(i + 1, end);
+          out += `<code>${this.escapeHtml(raw)}</code>`;
+          i = end + 1;
+          continue;
+        }
+      }
+
+      if (text.startsWith('**', i)) {
+        const end = text.indexOf('**', i + 2);
+        if (end !== -1) {
+          const raw = text.slice(i + 2, end);
+          out += `<b>${this.formatInlineMarkdownToHtml(raw)}</b>`;
+          i = end + 2;
+          continue;
+        }
+      }
+
+      if (text[i] === '[') {
+        const mid = text.indexOf('](', i + 1);
+        if (mid !== -1) {
+          const end = text.indexOf(')', mid + 2);
+          if (end !== -1) {
+            const labelRaw = text.slice(i + 1, mid);
+            const urlRaw = text.slice(mid + 2, end);
+            const label = this.formatInlineMarkdownToHtml(labelRaw);
+            const url = this.escapeHtmlAttribute(urlRaw);
+            out += `<a href="${url}">${label}</a>`;
+            i = end + 1;
+            continue;
+          }
+        }
+      }
+
+      out += this.escapeHtml(text[i]);
+      i += 1;
+    }
+
+    return out;
+  }
+
+  private formatTextBlockMarkdownToHtml(raw: string): string {
+    const lines = raw.split('\n');
+    const rendered = lines.map(line => {
+      const m = line.match(/^(\s*)[-*]\s+(.*)$/);
+      if (m) {
+        const indent = m[1] || '';
+        const body = m[2] || '';
+        return `${this.escapeHtml(indent)}• ${this.formatInlineMarkdownToHtml(body)}`;
+      }
+      return this.formatInlineMarkdownToHtml(line);
+    });
+    return rendered.join('\n');
+  }
+
+  private async sendMarkdownAsTelegramHtml(chatId: number, markdown: string, options: any = {}): Promise<number> {
+    const maxPayloadLength = 4000;
+    const blocks = this.parseMarkdownCodeBlocks(markdown);
+    let pending = '';
+    let sentCount = 0;
+
+    const flushPending = async () => {
+      if (!pending) return;
+      await this.sendHtmlMessage(chatId, pending, options);
+      sentCount += 1;
+      pending = '';
+    };
+
+    for (const b of blocks) {
+      if (b.kind === 'code') {
+        await flushPending();
+
+        const safeLang = (b.lang || '').match(/^[a-zA-Z0-9_+-]{1,32}$/) ? b.lang : undefined;
+        const classAttr = safeLang ? ` class="language-${this.escapeHtmlAttribute(safeLang)}"` : '';
+        const wrapPrefix = `<pre><code${classAttr}>`;
+        const wrapSuffix = '</code></pre>';
+
+        const codeChunks = this.chunkRawForHtmlWrapper(b.raw, wrapPrefix, wrapSuffix, maxPayloadLength);
+        for (const c of codeChunks) {
+          await this.sendHtmlMessage(chatId, wrapPrefix + this.escapeHtml(c) + wrapSuffix, options);
+          sentCount += 1;
+        }
+        continue;
+      }
+
+      const html = this.formatTextBlockMarkdownToHtml(b.raw);
+      const piece = pending ? `${pending}\n\n${html}` : html;
+      if (piece.length <= maxPayloadLength) {
+        pending = piece;
+        continue;
+      }
+
+      await flushPending();
+      if (html.length <= maxPayloadLength) {
+        pending = html;
+        continue;
+      }
+
+      const count = await this.sendPreMessage(chatId, b.raw, options);
+      sentCount += count;
+    }
+
+    await flushPending();
+    return sentCount;
+  }
+
   /**
    * Answer callback query
    */
@@ -255,22 +501,47 @@ export class TelegramBot {
     let session = this.sessions.get(chatId);
 
     if (!session) {
-      const opencodeSessionId = `${this.config.opencode.sessionPrefix}-${chatId}`;
+      const sessionKey = `${this.config.opencode.sessionPrefix}-${chatId}`;
       session = {
         chatId,
-        opencodeSessionId,
+        sessionKey,
+        opencodeSessionId: null,
         currentAgent: this.config.opencode.defaultAgent,
         workingDirectory: this.config.opencode.workingDirectory,
+        gateway: new OpencodeGateway(this.serverUrl, this.config.opencode.workingDirectory),
         createdAt: new Date(),
         lastActivity: new Date(),
       };
       this.sessions.set(chatId, session);
       const timestamp = new Date().toISOString();
-      console.log(`[${timestamp}] [bot] created session for ${chatId} (${opencodeSessionId})`);
+      console.log(`[${timestamp}] [bot] created session for ${chatId} (${sessionKey})`);
     }
 
     session.lastActivity = new Date();
     return session;
+  }
+
+  private async ensureOpencodeSession(session: TelegramSession): Promise<void> {
+    if (session.opencodeSessionId) {
+      session.gateway.setSessionId(session.opencodeSessionId);
+      return;
+    }
+
+    const roots = await session.gateway.listRootSessions(200);
+    const candidates = roots
+      .filter(s => (s.title || '').startsWith(session.sessionKey))
+      .sort((a, b) => (b.updated || 0) - (a.updated || 0));
+
+    if (candidates.length > 0) {
+      const id = candidates[0].id;
+      session.opencodeSessionId = id;
+      session.gateway.setSessionId(id);
+      return;
+    }
+
+    const created = await session.gateway.createRootSession(session.sessionKey);
+    session.opencodeSessionId = created;
+    session.gateway.setSessionId(created);
   }
 
   /**
@@ -310,7 +581,7 @@ export class TelegramBot {
       ? `[Working in: ${session.workingDirectory}]\n\n${message}`
       : message;
     
-    return this.gateway.sendMessage(contextMessage);
+    return session.gateway.sendMessage(contextMessage);
   }
 
   /**
@@ -410,8 +681,8 @@ export class TelegramBot {
       '/metis \\[message\\] - Use metis agent\n' +
       '/status - Show session status\n' +
       '/new - Create new session\n' +
-      '/list - List all sessions\n' +
-      '/switch <number> - Switch to session by number\n' +
+      '/list - List sessions for this chat\n' +
+      '/switch <number> - Switch session (this chat)\n' +
       '/cd [path] - Show/change working directory\n' +
       '/reset - Delete session group (like TUI ctrl-d)\n' +
       '/reset-agent - Reset current child agent session\n\n' +
@@ -438,8 +709,8 @@ export class TelegramBot {
       'Commands:\n' +
       '/status - Show session status\n' +
       '/new - Create new session\n' +
-      '/list - List all sessions\n' +
-      '/switch <number> - Switch to session by number\n' +
+      '/list - List sessions for this chat\n' +
+      '/switch <number> - Switch session (this chat)\n' +
       '/cd [path] - Show/change working directory\n' +
       '/reset - Delete session group (like TUI ctrl-d)\n' +
       '/reset-agent - Reset current child agent session\n\n' +
@@ -453,9 +724,13 @@ export class TelegramBot {
 
   private async handleReset(chatId: number): Promise<void> {
     try {
-      const before = this.gateway.getSessionId();
-      const result = await this.gateway.resetSessionGroup();
-      const after = this.gateway.getSessionId();
+      const session = this.getSession(chatId);
+      await this.ensureOpencodeSession(session);
+
+      const before = session.gateway.getSessionId();
+      const result = await session.gateway.resetSessionGroup();
+      const after = session.gateway.getSessionId();
+      session.opencodeSessionId = after || result.newSessionID;
 
       await this.sendMarkdownMessage(
         chatId,
@@ -474,9 +749,13 @@ export class TelegramBot {
 
   private async handleResetAgent(chatId: number): Promise<void> {
     try {
-      const before = this.gateway.getSessionId();
-      const result = await this.gateway.resetCurrentChildSession();
-      const after = this.gateway.getSessionId();
+      const session = this.getSession(chatId);
+      await this.ensureOpencodeSession(session);
+
+      const before = session.gateway.getSessionId();
+      const result = await session.gateway.resetCurrentChildSession();
+      const after = session.gateway.getSessionId();
+      session.opencodeSessionId = after;
 
       await this.sendMarkdownMessage(
         chatId,
@@ -494,7 +773,8 @@ export class TelegramBot {
 
   private async handleStatus(chatId: number): Promise<void> {
     const session = this.getSession(chatId);
-    const sessionId = this.gateway.getSessionId();
+    await this.ensureOpencodeSession(session);
+    const sessionId = session.gateway.getSessionId();
     const gatewayStatus = '✅ Connected';
 
     const uptime = process.uptime();
@@ -516,10 +796,13 @@ export class TelegramBot {
 
   private async handleNew(chatId: number): Promise<void> {
     try {
-      const newSessionId = await this.gateway.createNewSession();
+      const session = this.getSession(chatId);
+      const title = `${session.sessionKey}-${Date.now()}`;
+      const newSessionId = await session.gateway.createRootSession(title);
+      session.opencodeSessionId = newSessionId;
       let projectID: string | undefined;
       try {
-        const info = await this.gateway.getSessionInfo(newSessionId);
+        const info = await session.gateway.getSessionInfo(newSessionId);
         projectID = info?.projectID;
       } catch {
         projectID = undefined;
@@ -543,8 +826,12 @@ export class TelegramBot {
 
   private async handleList(chatId: number): Promise<void> {
     try {
-      const sessions = await this.gateway.listRootSessions(50);
-      const currentSessionId = this.gateway.getSessionId();
+      const session = this.getSession(chatId);
+      await this.ensureOpencodeSession(session);
+
+      const allRoots = await session.gateway.listRootSessions(200);
+      const sessions = allRoots.filter(s => (s.title || '').startsWith(session.sessionKey));
+      const currentSessionId = session.gateway.getSessionId();
 
       if (sessions.length === 0) {
         await this.sendMessage(chatId, 'Sessions\n\nNo sessions found. Use /new to create one.');
@@ -563,14 +850,11 @@ export class TelegramBot {
       const webUrl = this.getOpencodeWebUrl();
 
       const message =
-        `Root sessions (${sessions.length} shown)\n\n${sessionList}\n\n` +
+        `Sessions (${sessions.length} shown)\n\n${sessionList}\n\n` +
         `Use /switch <number> to switch sessions\n` +
         `View in opencode web: ${webUrl}/`;
 
-      const chunks = this.chunkMessage(message);
-      for (const chunk of chunks) {
-        await this.sendMessage(chatId, chunk);
-      }
+      await this.sendPreMessage(chatId, message);
     } catch (error: any) {
       const errorMsg = `❌ Failed to list sessions: ${error instanceof Error ? error.message : 'Unknown error'}`;
       await this.sendMessage(chatId, errorMsg);
@@ -590,7 +874,10 @@ export class TelegramBot {
     }
 
     try {
-      const sessions = await this.gateway.listRootSessions(50);
+      const session = this.getSession(chatId);
+      await this.ensureOpencodeSession(session);
+      const allRoots = await session.gateway.listRootSessions(200);
+      const sessions = allRoots.filter(s => (s.title || '').startsWith(session.sessionKey));
 
       if (num < 1 || num > sessions.length) {
         await this.sendMessage(
@@ -601,7 +888,8 @@ export class TelegramBot {
       }
 
       const targetSession = sessions[num - 1];
-      await this.gateway.switchSession(targetSession.id);
+      await session.gateway.switchSession(targetSession.id);
+      session.opencodeSessionId = targetSession.id;
 
       const sessionUrl = this.buildOpencodeSessionWebUrl(targetSession.id, targetSession.projectID);
       await this.sendMessage(
@@ -636,7 +924,7 @@ export class TelegramBot {
     // Change working directory
     const newPath = path.startsWith('/') ? path : `${session.workingDirectory}/${path}`;
     session.workingDirectory = newPath;
-    this.gateway.setDirectory(newPath);
+    session.gateway.setDirectory(newPath);
 
     await this.sendMarkdownMessage(
       chatId,
@@ -709,12 +997,13 @@ export class TelegramBot {
   }
 
   private async maybeSendPendingQuestions(chatId: number): Promise<void> {
-    const currentSessionId = this.gateway.getSessionId();
+    const session = this.getSession(chatId);
+    const currentSessionId = session.gateway.getSessionId();
     if (!currentSessionId) return;
 
     let pending: PendingQuestionRequest[];
     try {
-      pending = await this.gateway.listPendingQuestions();
+      pending = await session.gateway.listPendingQuestions();
     } catch (error) {
       console.warn('[bot] failed to list pending questions:', error);
       return;
@@ -743,12 +1032,13 @@ export class TelegramBot {
   }
 
   private async maybeSendPendingPermissions(chatId: number): Promise<void> {
-    const currentSessionId = this.gateway.getSessionId();
+    const session = this.getSession(chatId);
+    const currentSessionId = session.gateway.getSessionId();
     if (!currentSessionId) return;
 
     let pending: PendingPermission[];
     try {
-      pending = await this.gateway.listPendingPermissions();
+      pending = await session.gateway.listPendingPermissions();
     } catch (error) {
       console.warn('[bot] failed to list pending permissions:', error);
       return;
@@ -790,8 +1080,9 @@ export class TelegramBot {
       const timestamp = new Date().toISOString();
 
       try {
+        const session = this.getSession(chatId);
         if (action === 'reject') {
-          await this.gateway.rejectQuestion(requestID);
+          await session.gateway.rejectQuestion(requestID);
           if (message?.message_id) {
             await this.deleteMessage(chatId, message.message_id);
           }
@@ -806,7 +1097,7 @@ export class TelegramBot {
           return;
         }
 
-        const pending = await this.gateway.listPendingQuestions();
+        const pending = await session.gateway.listPendingQuestions();
         const req = pending.find(r => r.id === requestID);
         if (!req) {
           await this.sendMessage(chatId, '⚠️ 该问题已不存在（可能已超时或已被处理）。请重试你的请求。');
@@ -840,7 +1131,7 @@ export class TelegramBot {
           return;
         }
 
-        await this.gateway.replyQuestion(requestID, state.answers);
+        await session.gateway.replyQuestion(requestID, state.answers);
         this.questionAnswerState.delete(requestID);
 
         console.log(`[${timestamp}] [bot] question replied: ${requestID}`);
@@ -878,7 +1169,7 @@ export class TelegramBot {
       const reply = action === 'once' ? 'once' : action === 'always' ? 'always' : 'reject';
 
       try {
-        await this.gateway.replyPermission(requestID, reply, `telegram_user=${userId}`);
+        await session.gateway.replyPermission(requestID, reply, `telegram_user=${userId}`);
         console.log(`[${timestamp}] [bot] permission replied: ${requestID} -> ${reply}`);
 
         if (message?.message_id) {
@@ -1026,14 +1317,12 @@ export class TelegramBot {
     void (async () => {
       const timestamp = new Date().toISOString();
       try {
+        await this.ensureOpencodeSession(session);
         await this.maybeSendPendingInteractions(chatId);
         const response = await this.executeOpenCode(messageContent, session, agent);
         await this.maybeSendPendingInteractions(chatId);
-        const chunks = this.chunkMessage(response);
-        for (const chunk of chunks) {
-          await this.sendMessage(chatId, chunk);
-        }
-        console.log(`[${timestamp}] [bot] response sent (${chunks.length} chunks, ${response.length} chars)`);
+        const msgCount = await this.sendMarkdownAsTelegramHtml(chatId, response);
+        console.log(`[${timestamp}] [bot] response sent (${msgCount} messages, ${response.length} chars)`);
       } catch (error: any) {
         const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
         console.error(`[${timestamp}] [bot] execution error:`, error);

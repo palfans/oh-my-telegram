@@ -60,6 +60,41 @@ export class OpencodeGateway {
     this.clientV2 = createOpencodeClientV2({ baseUrl: serverUrl, directory });
   }
 
+  setSessionId(sessionId: string | null): void {
+    this.sessionId = sessionId;
+  }
+
+  async findRootSessionByTitle(title: string): Promise<string | null> {
+    const result = await this.clientV2.session.list({
+      directory: this.directory,
+      roots: true,
+      search: title,
+      limit: 50,
+    });
+
+    if (result.error) {
+      throw new Error(`Session list failed: ${String(result.error)}`);
+    }
+
+    const sessions = result.data || [];
+    const exact = sessions.find((s: any) => (s?.title || '') === title);
+    return exact?.id || null;
+  }
+
+  async createRootSession(title?: string): Promise<string> {
+    const result = await this.clientV2.session.create({
+      directory: this.directory,
+      title,
+    });
+
+    if (result.error || !result.data?.id) {
+      throw new Error(`Session creation failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    this.sessionId = result.data.id;
+    return this.sessionId;
+  }
+
   setDirectory(directory?: string): void {
     if (this.directory === directory) return;
     this.directory = directory;
@@ -326,18 +361,9 @@ export class OpencodeGateway {
   async createNewSession(): Promise<string> {
     console.log('[OpencodeGateway] Creating new session...');
 
-    const createResult = await this.clientV1.session.create({
-      body: {},
-    });
-
-    if (createResult.error || !createResult.data?.id) {
-      throw new Error(`Session creation failed: ${createResult.error ? String(createResult.error) : 'unknown error'}`);
-    }
-
-    this.sessionId = createResult.data.id;
-    console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
-
-    return this.sessionId!;
+    const id = await this.createRootSession();
+    console.log(`[OpencodeGateway] Created new session: ${id}`);
+    return id;
   }
 
   async getSessionInfo(sessionId: string): Promise<any> {
