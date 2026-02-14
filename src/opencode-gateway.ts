@@ -18,10 +18,22 @@ export class OpencodeGateway {
   private client: ReturnType<typeof createOpencodeClient>;
   private serverUrl: string;
   private sessionId: string | null = null;
+  private directory?: string;
 
-  constructor(serverUrl: string = 'http://localhost:4096') {
+  constructor(serverUrl: string = 'http://localhost:4096', directory?: string) {
     this.serverUrl = serverUrl;
-    this.client = createOpencodeClient({ baseUrl: serverUrl });
+    this.directory = directory;
+    this.client = createOpencodeClient({ baseUrl: serverUrl, directory });
+  }
+
+  setDirectory(directory?: string): void {
+    if (this.directory === directory) return;
+    this.directory = directory;
+    this.client = createOpencodeClient({ baseUrl: this.serverUrl, directory });
+  }
+
+  getDirectory(): string | undefined {
+    return this.directory;
   }
 
   async initialize(sessionId?: string): Promise<void> {

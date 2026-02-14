@@ -77,6 +77,7 @@ export interface OhMyTelegramConfig {
     defaultAgent: string;
     workingDirectory: string;
     sessionPrefix: string;
+    webUrl?: string;
   };
   keyboard?: {
     enabled: boolean;
@@ -104,7 +105,7 @@ export class TelegramBot {
     this.config = config;
     this.botToken = config.telegram.botToken;
     this.apiUrl = `https://api.telegram.org/bot${this.botToken}`;
-    this.gateway = new OpencodeGateway('http://localhost:4096');
+    this.gateway = new OpencodeGateway('http://localhost:4096', config.opencode.workingDirectory);
     this.sessions = new Map();
     this.httpClient = this.createTelegramHttpClient();
   }
@@ -152,6 +153,11 @@ export class TelegramBot {
     }
 
     return axios.create(axiosConfig);
+  }
+
+  private getOpencodeWebUrl(): string {
+    const raw = this.config.opencode.webUrl || 'http://127.0.0.1:4096';
+    return raw.replace(/\/+$/, '');
   }
 
   /**
@@ -369,7 +375,7 @@ export class TelegramBot {
       '/switch <number> - Switch to session by number\n' +
       '/cd [path] - Show/change working directory\n' +
       '/reset - Clear conversation history\n\n' +
-      'Web UI: http://127.0.0.1:55986/\n\n' +
+      `Web UI: ${this.getOpencodeWebUrl()}/\n\n` +
       'Or just send a message to use the default agent.',
       replyMarkup
     );
@@ -397,7 +403,7 @@ export class TelegramBot {
       '/cd [path] - Show/change working directory\n' +
       '/reset - Clear conversation history\n\n' +
       'Web UI:\n' +
-      'opencode web: http://127.0.0.1:55986/\n\n' +
+      `opencode web: ${this.getOpencodeWebUrl()}/\n\n` +
       'Example:\n' +
       '/oracle explain this code\n' +
       'refactor this function'
@@ -443,12 +449,13 @@ export class TelegramBot {
   private async handleNew(chatId: number): Promise<void> {
     try {
       const newSessionId = await this.gateway.createNewSession();
+      const webUrl = this.getOpencodeWebUrl();
       await this.sendMarkdownMessage(
         chatId,
         `✅ *New session created*\n\n` +
         `Session ID: \`${newSessionId}\`\n\n` +
         `View in opencode web:\n` +
-        `http://127.0.0.1:55986/session/${newSessionId}\n\n` +
+        `${webUrl}/session/${newSessionId}\n\n` +
         `Starting fresh conversation.`
       );
     } catch (error: any) {
@@ -463,24 +470,25 @@ export class TelegramBot {
       const currentSessionId = this.gateway.getSessionId();
 
       if (sessions.length === 0) {
-        await this.sendMarkdownMessage(chatId, '📋 *Sessions*\n\nNo sessions found. Use /new to create one.');
+        await this.sendMessage(chatId, 'Sessions\n\nNo sessions found. Use /new to create one.');
         return;
       }
 
       const sessionList = sessions
         .map((s, i) => {
-          const isCurrent = s.id === currentSessionId ? '✅ *Current*' : '';
+          const isCurrent = s.id === currentSessionId ? ' (current)' : '';
           const title = s.title || 'Untitled';
           const updated = s.updated ? new Date(s.updated).toLocaleString() : 'Unknown';
-          return `${i + 1}. ${isCurrent} \`${s.id}\`\n   ${title}\n   Updated: ${updated}`;
+          return `${i + 1}. ${s.id}${isCurrent}\n   ${title}\n   Updated: ${updated}`;
         })
         .join('\n\n');
 
-      await this.sendMarkdownMessage(
+      const webUrl = this.getOpencodeWebUrl();
+      await this.sendMessage(
         chatId,
-        `📋 *Sessions* (${sessions.length} total)\n\n${sessionList}\n\n` +
+        `Sessions (${sessions.length} total)\n\n${sessionList}\n\n` +
         `Use /switch <number> to switch sessions\n` +
-        `View in opencode web: http://127.0.0.1:55986/`
+        `View in opencode web: ${webUrl}/`
       );
     } catch (error: any) {
       const errorMsg = `❌ Failed to list sessions: ${error instanceof Error ? error.message : 'Unknown error'}`;
@@ -514,14 +522,15 @@ export class TelegramBot {
       const targetSession = sessions[num - 1];
       await this.gateway.switchSession(targetSession.id);
 
-      await this.sendMarkdownMessage(
+      const webUrl = this.getOpencodeWebUrl();
+      await this.sendMessage(
         chatId,
-        `✅ *Switched to session*\n\n` +
+        `Switched to session\n\n` +
         `Number: ${num}\n` +
         `Title: ${targetSession.title || 'Untitled'}\n` +
-        `Session ID: \`${targetSession.id}\`\n\n` +
+        `Session ID: ${targetSession.id}\n\n` +
         `View in opencode web:\n` +
-        `http://127.0.0.1:55986/session/${targetSession.id}`
+        `${webUrl}/session/${targetSession.id}`
       );
     } catch (error: any) {
       const errorMsg = `❌ Failed to switch session: ${error instanceof Error ? error.message : 'Unknown error'}`;
@@ -546,6 +555,7 @@ export class TelegramBot {
     // Change working directory
     const newPath = path.startsWith('/') ? path : `${session.workingDirectory}/${path}`;
     session.workingDirectory = newPath;
+    this.gateway.setDirectory(newPath);
 
     await this.sendMarkdownMessage(
       chatId,

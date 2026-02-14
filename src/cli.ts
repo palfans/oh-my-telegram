@@ -28,6 +28,7 @@ function loadConfig(configPath: string): any {
         workingDirectory: process.env.WORKING_DIRECTORY || process.cwd(),
         sessionPrefix: process.env.SESSION_PREFIX || 'telegram',
         opencodePath: process.env.OPENCODE_PATH || 'opencode',
+        webUrl: process.env.OPENCODE_WEB_URL || 'http://127.0.0.1:4096',
       },
     };
   }
