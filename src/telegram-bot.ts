@@ -1,4 +1,5 @@
-import axios from 'axios';
+import axios, { type AxiosInstance } from 'axios';
+import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
 import { OpencodeGateway } from './opencode-gateway.js';
@@ -93,6 +94,7 @@ export class TelegramBot {
   private sessions: Map<number, TelegramSession>;
   private botToken: string;
   private apiUrl: string;
+  private httpClient: AxiosInstance;
   private isRunning: boolean = false;
   private pollingInterval: number = 1000; // ms between polling attempts
   private longPollTimeout: number = 30; // seconds for long polling
@@ -104,6 +106,7 @@ export class TelegramBot {
     this.apiUrl = `https://api.telegram.org/bot${this.botToken}`;
     this.gateway = new OpencodeGateway('http://localhost:4096');
     this.sessions = new Map();
+    this.httpClient = this.createTelegramHttpClient();
   }
 
   async initialize(): Promise<void> {
@@ -114,22 +117,41 @@ export class TelegramBot {
    * Make API call to Telegram
    */
   private async apiCall(method: string, payload: any = {}): Promise<any> {
-    // Configure proxy from environment variables if available
-    const axiosConfig: any = {
-      timeout: method === 'getUpdates' ? 35000 : 30000,
-    };
-    
+    const requestTimeoutMs = method === 'getUpdates'
+      ? (this.longPollTimeout * 1000 + 5000)
+      : 30000;
+
+    const response = await this.httpClient.post(`/${method}`, payload, {
+      timeout: requestTimeoutMs,
+    });
+    return response.data;
+  }
+
+  private createTelegramHttpClient(): AxiosInstance {
     const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
     const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
     const proxyUrl = httpsProxy || httpProxy;
-    
+
+    const agentOptions: https.AgentOptions = {
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 64,
+      maxFreeSockets: 32,
+      scheduling: 'lifo',
+    };
+
+    const axiosConfig: any = {
+      baseURL: this.apiUrl,
+    };
+
     if (proxyUrl) {
-      axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
+      axiosConfig.httpsAgent = new HttpsProxyAgent(proxyUrl, agentOptions);
       axiosConfig.proxy = false; // Disable axios built-in proxy when using custom agent
+    } else {
+      axiosConfig.httpsAgent = new https.Agent(agentOptions);
     }
 
-    const response = await axios.post(`${this.apiUrl}/${method}`, payload, axiosConfig);
-    return response.data;
+    return axios.create(axiosConfig);
   }
 
   /**
@@ -138,17 +160,30 @@ export class TelegramBot {
   async sendMessage(chatId: number, text: string, options: any = {}): Promise<void> {
     const timestamp = new Date().toISOString();
     try {
-      await this.apiCall('sendMessage', {
+      const payload: any = {
         chat_id: chatId,
         text,
-        parse_mode: 'Markdown',
         ...options,
-      });
+      };
+
+      if (payload.parse_mode == null) {
+        delete payload.parse_mode;
+      }
+
+      await this.apiCall('sendMessage', payload);
       console.log(`[${timestamp}] [bot] sent message to ${chatId} (${text.length} chars)`);
     } catch (error: any) {
       console.error(`[${timestamp}] [bot] failed to send message:`, error.response?.data || error.message);
       throw error;
     }
+  }
+
+  private async sendMarkdownMessage(chatId: number, text: string, options: any = {}): Promise<void> {
+    const { parse_mode, ...rest } = options;
+    return this.sendMessage(chatId, text, {
+      ...rest,
+      parse_mode: parse_mode ?? 'Markdown',
+    });
   }
 
   /**
@@ -319,7 +354,7 @@ export class TelegramBot {
       },
     } : {};
 
-    await this.sendMessage(
+    await this.sendMarkdownMessage(
       chatId,
       '🤖 *oh-my-telegram* - OpenCode on Telegram\n\n' +
       'Commands:\n' +
@@ -344,7 +379,7 @@ export class TelegramBot {
    * Handle /help command
    */
   private async handleHelp(chatId: number): Promise<void> {
-    await this.sendMessage(
+    await this.sendMarkdownMessage(
       chatId,
       '📖 *Help*\n\n' +
       'Send any message to execute OpenCode agents.\n\n' +
@@ -374,7 +409,7 @@ export class TelegramBot {
     await this.gateway.resetSession();
     const newSessionId = this.gateway.getSessionId();
 
-    await this.sendMessage(
+    await this.sendMarkdownMessage(
       chatId,
       `✅ *Conversation history cleared*\n\n` +
       `Old session: \`${oldSessionId || 'none'}\`\n` +
@@ -391,7 +426,7 @@ export class TelegramBot {
     const uptime = process.uptime();
     const uptimeFormatted = formatUptime(uptime);
 
-    await this.sendMessage(
+    await this.sendMarkdownMessage(
       chatId,
       '📊 *Bot Status*\n\n' +
       `*Session:* \`${sessionId}\`\n` +
@@ -408,7 +443,7 @@ export class TelegramBot {
   private async handleNew(chatId: number): Promise<void> {
     try {
       const newSessionId = await this.gateway.createNewSession();
-      await this.sendMessage(
+      await this.sendMarkdownMessage(
         chatId,
         `✅ *New session created*\n\n` +
         `Session ID: \`${newSessionId}\`\n\n` +
@@ -428,7 +463,7 @@ export class TelegramBot {
       const currentSessionId = this.gateway.getSessionId();
 
       if (sessions.length === 0) {
-        await this.sendMessage(chatId, '📋 *Sessions*\n\nNo sessions found. Use /new to create one.');
+        await this.sendMarkdownMessage(chatId, '📋 *Sessions*\n\nNo sessions found. Use /new to create one.');
         return;
       }
 
@@ -441,7 +476,7 @@ export class TelegramBot {
         })
         .join('\n\n');
 
-      await this.sendMessage(
+      await this.sendMarkdownMessage(
         chatId,
         `📋 *Sessions* (${sessions.length} total)\n\n${sessionList}\n\n` +
         `Use /switch <number> to switch sessions\n` +
@@ -479,7 +514,7 @@ export class TelegramBot {
       const targetSession = sessions[num - 1];
       await this.gateway.switchSession(targetSession.id);
 
-      await this.sendMessage(
+      await this.sendMarkdownMessage(
         chatId,
         `✅ *Switched to session*\n\n` +
         `Number: ${num}\n` +
@@ -499,7 +534,7 @@ export class TelegramBot {
 
     if (!path || path.trim() === '') {
       // Show current working directory
-      await this.sendMessage(
+      await this.sendMarkdownMessage(
         chatId,
         `📁 *Current Working Directory*\n\n` +
         `\`${session.workingDirectory}\`\n\n` +
@@ -512,7 +547,7 @@ export class TelegramBot {
     const newPath = path.startsWith('/') ? path : `${session.workingDirectory}/${path}`;
     session.workingDirectory = newPath;
 
-    await this.sendMessage(
+    await this.sendMarkdownMessage(
       chatId,
       `✅ *Working directory changed*\n\n` +
       `New path: \`${newPath}\`\n\n` +
