@@ -3,6 +3,7 @@ import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
 import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest } from './opencode-gateway.js';
+import { TaskNotifier, type TaskHandle } from './task-notifier.js';
 
 /**
  * Telegram update structure
@@ -86,6 +87,10 @@ export interface OhMyTelegramConfig {
     enabled: boolean;
     rows: KeyboardRow[];
   };
+
+  taskNotifier?: {
+    enabled?: boolean;
+  };
 }
 
 /**
@@ -104,6 +109,9 @@ export class TelegramBot {
   private questionAnswerState: Map<string, { answers: Array<Array<string>>; total: number }> = new Map();
 
   private inFlightByChatId: Map<number, boolean> = new Map();
+  private taskHandleByChatId: Map<number, TaskHandle> = new Map();
+  private taskStageByChatId: Map<number, string> = new Map();
+  private notifier: TaskNotifier;
   private isRunning: boolean = false;
   private pollingInterval: number = 1000; // ms between polling attempts
   private longPollTimeout: number = 30; // seconds for long polling
@@ -116,6 +124,16 @@ export class TelegramBot {
     this.serverUrl = 'http://localhost:4096';
     this.sessions = new Map();
     this.httpClient = this.createTelegramHttpClient();
+
+    this.notifier = new TaskNotifier(
+      {
+        sendMessage: (chatId, text, options) => this.sendMessage(chatId, text, options),
+        editMessageText: (chatId, messageId, text, options) => this.editMessageText(chatId, messageId, text, options),
+      },
+      {
+        enabled: this.config.taskNotifier?.enabled !== false,
+      }
+    );
   }
 
   async initialize(): Promise<void> {
@@ -178,7 +196,7 @@ export class TelegramBot {
   /**
    * Send message to Telegram chat
    */
-  async sendMessage(chatId: number, text: string, options: any = {}): Promise<void> {
+  async sendMessage(chatId: number, text: string, options: any = {}): Promise<number | null> {
     const timestamp = new Date().toISOString();
     try {
       const payload: any = {
@@ -191,8 +209,10 @@ export class TelegramBot {
         delete payload.parse_mode;
       }
 
-      await this.apiCall('sendMessage', payload);
+      const result = await this.apiCall('sendMessage', payload);
       console.log(`[${timestamp}] [bot] sent message to ${chatId} (${text.length} chars)`);
+      const messageId = result?.result?.message_id;
+      return typeof messageId === 'number' ? messageId : null;
     } catch (error: any) {
       console.error(`[${timestamp}] [bot] failed to send message:`, error.response?.data || error.message);
       throw error;
@@ -201,7 +221,7 @@ export class TelegramBot {
 
   private async sendMarkdownMessage(chatId: number, text: string, options: any = {}): Promise<void> {
     const { parse_mode, ...rest } = options;
-    return this.sendMessage(chatId, text, {
+    await this.sendMessage(chatId, text, {
       ...rest,
       parse_mode: parse_mode ?? 'Markdown',
     });
@@ -209,10 +229,25 @@ export class TelegramBot {
 
   private async sendHtmlMessage(chatId: number, text: string, options: any = {}): Promise<void> {
     const { parse_mode, ...rest } = options;
-    return this.sendMessage(chatId, text, {
+    await this.sendMessage(chatId, text, {
       ...rest,
       parse_mode: parse_mode ?? 'HTML',
     });
+  }
+
+  private async editMessageText(chatId: number, messageId: number, text: string, options: any = {}): Promise<void> {
+    const payload: any = {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...options,
+    };
+
+    if (payload.parse_mode == null) {
+      delete payload.parse_mode;
+    }
+
+    await this.apiCall('editMessageText', payload);
   }
 
   private escapeHtml(text: string): string {
@@ -1023,12 +1058,42 @@ export class TelegramBot {
 
       const text = this.formatQuestionText(req, 0);
       await this.sendMessage(chatId, text, this.buildQuestionInlineKeyboard(req.id, 0, req.questions[0].options || []));
+      await this.updateTaskStage(chatId, 'waiting_question');
     }
   }
 
   private async maybeSendPendingInteractions(chatId: number): Promise<void> {
     await this.maybeSendPendingQuestions(chatId);
     await this.maybeSendPendingPermissions(chatId);
+  }
+
+  private async updateTaskStage(
+    chatId: number,
+    stage: 'running' | 'waiting_question' | 'waiting_permission' | 'cancelled'
+  ): Promise<void> {
+    const task = this.taskHandleByChatId.get(chatId);
+    if (!task) return;
+
+    const prev = this.taskStageByChatId.get(chatId);
+    if (prev === stage) return;
+    this.taskStageByChatId.set(chatId, stage);
+
+    if (stage === 'waiting_question') {
+      await task.set('❓ 等待你的选择（请点击按钮）');
+      return;
+    }
+
+    if (stage === 'waiting_permission') {
+      await task.set('⚠️ 等待你的授权（请点击按钮）');
+      return;
+    }
+
+    if (stage === 'cancelled') {
+      await task.set('⛔ 已取消');
+      return;
+    }
+
+    await task.set('⏳ 处理中…');
   }
 
   private async maybeSendPendingPermissions(chatId: number): Promise<void> {
@@ -1052,6 +1117,7 @@ export class TelegramBot {
       this.seenPermissionRequestIds.add(req.id);
       const text = this.formatPermissionRequestText(req);
       await this.sendMessage(chatId, text, this.buildPermissionInlineKeyboard(req.id));
+      await this.updateTaskStage(chatId, 'waiting_permission');
     }
   }
 
@@ -1087,6 +1153,7 @@ export class TelegramBot {
             await this.deleteMessage(chatId, message.message_id);
           }
           await this.sendMessage(chatId, '已取消选择，请重新发送你的请求。');
+          await this.updateTaskStage(chatId, 'cancelled');
           return;
         }
 
@@ -1136,6 +1203,7 @@ export class TelegramBot {
 
         console.log(`[${timestamp}] [bot] question replied: ${requestID}`);
         await this.sendMessage(chatId, '✅ 已提交选择，继续处理中…');
+        await this.updateTaskStage(chatId, 'running');
         await this.maybeSendPendingInteractions(chatId);
       } catch (error: any) {
         console.error(`[${timestamp}] [bot] question reply error:`, error);
@@ -1162,6 +1230,7 @@ export class TelegramBot {
         }
 
         this.startOpenCodeExecution(chatId, session.lastUserMessage, session, undefined);
+        void this.updateTaskStage(chatId, 'running');
 
         return;
       }
@@ -1177,6 +1246,7 @@ export class TelegramBot {
         }
 
         await this.sendMessage(chatId, `✅ 已提交授权：${reply}。如果操作没有自动继续，请点击“重试上一条”或重新发送请求。`);
+        await this.updateTaskStage(chatId, 'running');
       } catch (error: any) {
         console.error(`[${timestamp}] [bot] permission reply error:`, error);
         await this.sendMessage(chatId, `❌ 授权失败：${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -1309,6 +1379,11 @@ export class TelegramBot {
 
     this.inFlightByChatId.set(chatId, true);
 
+    const preview = messageContent.length > 80 ? `${messageContent.slice(0, 80)}…` : messageContent;
+    const task = this.notifier.createTask(chatId, `⏳ 已开始处理：\n${preview}`);
+    this.taskHandleByChatId.set(chatId, task);
+    this.taskStageByChatId.set(chatId, 'running');
+
     const pollIntervalMs = 1000;
     const poller = setInterval(() => {
       void this.maybeSendPendingInteractions(chatId);
@@ -1322,15 +1397,19 @@ export class TelegramBot {
         const response = await this.executeOpenCode(messageContent, session, agent);
         await this.maybeSendPendingInteractions(chatId);
         const msgCount = await this.sendMarkdownAsTelegramHtml(chatId, response);
+        await task.complete('✅ 已完成');
         console.log(`[${timestamp}] [bot] response sent (${msgCount} messages, ${response.length} chars)`);
       } catch (error: any) {
         const errorMsg = `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
         console.error(`[${timestamp}] [bot] execution error:`, error);
         await this.sendMessage(chatId, errorMsg);
+        await task.fail('❌ 失败');
         await this.maybeSendPendingInteractions(chatId);
       } finally {
         clearInterval(poller);
         this.inFlightByChatId.delete(chatId);
+        this.taskHandleByChatId.delete(chatId);
+        this.taskStageByChatId.delete(chatId);
       }
     })();
   }
