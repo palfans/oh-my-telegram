@@ -1,4 +1,36 @@
-import { createOpencodeClient } from '@opencode-ai/sdk';
+import { createOpencodeClient as createOpencodeClientV1 } from '@opencode-ai/sdk';
+import { createOpencodeClient as createOpencodeClientV2 } from '@opencode-ai/sdk/v2';
+
+export type PendingPermission = {
+  id: string;
+  sessionID: string;
+  permission: string;
+  patterns: string[];
+  always: string[];
+  metadata: Record<string, unknown>;
+  tool?: {
+    messageID: string;
+    callID: string;
+  };
+};
+
+export type PendingQuestionRequest = {
+  id: string;
+  sessionID: string;
+  questions: Array<{
+    header: string;
+    question: string;
+    options: Array<{
+      label: string;
+      description?: string;
+    }>;
+    multiple: boolean;
+  }>;
+  tool?: {
+    messageID: string;
+    callID: string;
+  };
+};
 
 interface OpencodeMessage {
   type: string;
@@ -15,7 +47,8 @@ interface OpencodeResponse {
 }
 
 export class OpencodeGateway {
-  private client: ReturnType<typeof createOpencodeClient>;
+  private clientV1: ReturnType<typeof createOpencodeClientV1>;
+  private clientV2: ReturnType<typeof createOpencodeClientV2>;
   private serverUrl: string;
   private sessionId: string | null = null;
   private directory?: string;
@@ -23,13 +56,15 @@ export class OpencodeGateway {
   constructor(serverUrl: string = 'http://localhost:4096', directory?: string) {
     this.serverUrl = serverUrl;
     this.directory = directory;
-    this.client = createOpencodeClient({ baseUrl: serverUrl, directory });
+    this.clientV1 = createOpencodeClientV1({ baseUrl: serverUrl, directory });
+    this.clientV2 = createOpencodeClientV2({ baseUrl: serverUrl, directory });
   }
 
   setDirectory(directory?: string): void {
     if (this.directory === directory) return;
     this.directory = directory;
-    this.client = createOpencodeClient({ baseUrl: this.serverUrl, directory });
+    this.clientV1 = createOpencodeClientV1({ baseUrl: this.serverUrl, directory });
+    this.clientV2 = createOpencodeClientV2({ baseUrl: this.serverUrl, directory });
   }
 
   getDirectory(): string | undefined {
@@ -39,7 +74,7 @@ export class OpencodeGateway {
   async initialize(sessionId?: string): Promise<void> {
     console.log(`[OpencodeGateway] Connecting to ${this.serverUrl}...`);
 
-    const configResult = await this.client.config.get();
+    const configResult = await this.clientV1.config.get();
     if (configResult.error) {
       throw new Error(`Server connection failed: ${String(configResult.error)}`);
     }
@@ -52,7 +87,21 @@ export class OpencodeGateway {
       return;
     }
 
-    const sessionsResult = await this.client.session.list();
+    try {
+      const rootsResult = await this.clientV2.session.list({
+        directory: this.directory,
+        roots: true,
+        limit: 1,
+      });
+      if (!rootsResult.error && rootsResult.data && rootsResult.data.length > 0) {
+        this.sessionId = rootsResult.data[0].id;
+        console.log(`[OpencodeGateway] Reusing root session: ${this.sessionId}`);
+        return;
+      }
+    } catch {
+    }
+
+    const sessionsResult = await this.clientV1.session.list();
     if (sessionsResult.error) {
       throw new Error(`Session list failed: ${String(sessionsResult.error)}`);
     }
@@ -62,28 +111,32 @@ export class OpencodeGateway {
     if (sessions.length > 0) {
       this.sessionId = sessions[0].id;
       console.log(`[OpencodeGateway] Reusing session: ${this.sessionId}`);
-    } else {
-      const createResult = await this.client.session.create({
-        body: {},
-      });
-
-      if (createResult.error || !createResult.data?.id) {
-        throw new Error(`Session creation failed: ${createResult.error ? String(createResult.error) : 'unknown error'}`);
-      }
-
-      this.sessionId = createResult.data.id;
-      console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
+      return;
     }
+
+    const createResult = await this.clientV1.session.create({
+      body: {},
+    });
+
+    if (createResult.error || !createResult.data?.id) {
+      throw new Error(`Session creation failed: ${createResult.error ? String(createResult.error) : 'unknown error'}`);
+    }
+
+    this.sessionId = createResult.data.id;
+    console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
   }
 
   async sendMessage(message: string): Promise<string> {
     if (!this.sessionId) {
-      throw new Error('Gateway not initialized. Call initialize() first.');
+      await this.initialize();
+      if (!this.sessionId) {
+        throw new Error('Gateway not initialized. Call initialize() first.');
+      }
     }
 
     console.log(`[OpencodeGateway] Sending message to session ${this.sessionId}...`);
 
-    const result = await this.client.session.prompt({
+    const result = await this.clientV1.session.prompt({
       path: { id: this.sessionId },
       body: {
         parts: [{ type: 'text', text: message }],
@@ -119,20 +172,161 @@ export class OpencodeGateway {
   }
 
   async resetSession(): Promise<void> {
-    if (this.sessionId) {
-      console.log(`[OpencodeGateway] Deleting session ${this.sessionId}...`);
-      await this.client.session.delete({
-        path: { id: this.sessionId },
-      });
+    const deleting = this.sessionId;
+    this.sessionId = null;
+
+    if (deleting) {
+      console.log(`[OpencodeGateway] Deleting session ${deleting}...`);
+      try {
+        await this.clientV1.session.delete({
+          path: { id: deleting },
+        });
+      } catch (error) {
+        console.warn(`[OpencodeGateway] Session delete failed (ignored): ${String(error)}`);
+      }
     }
 
     await this.initialize();
   }
 
+  async listRootSessions(limit: number = 50): Promise<Array<{ id: string; title?: string; updated?: number; projectID?: string }>> {
+    const result = await this.clientV2.session.list({
+      directory: this.directory,
+      roots: true,
+      limit,
+    });
+
+    if (result.error) {
+      throw new Error(`Session list failed: ${String(result.error)}`);
+    }
+
+    const sessions = result.data || [];
+    return sessions.map((s: any) => ({
+      id: s.id,
+      title: s.title,
+      updated: s.time?.updated,
+      projectID: s.projectID,
+    }));
+  }
+
+  private async getSessionV2(sessionID: string): Promise<any> {
+    const result = await this.clientV2.session.get({
+      sessionID,
+      directory: this.directory,
+    });
+
+    if (result.error || !result.data) {
+      throw new Error(`Session get failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return result.data as any;
+  }
+
+  private async listChildrenV2(sessionID: string): Promise<any[]> {
+    const result = await this.clientV2.session.children({
+      sessionID,
+      directory: this.directory,
+    });
+
+    if (result.error) {
+      throw new Error(`Session children failed: ${String(result.error)}`);
+    }
+
+    return (result.data || []) as any[];
+  }
+
+  private async deleteSessionV2(sessionID: string): Promise<void> {
+    const result = await this.clientV2.session.delete({
+      sessionID,
+      directory: this.directory,
+    });
+
+    if (result.error) {
+      throw new Error(`Session delete failed: ${String(result.error)}`);
+    }
+  }
+
+  private async getRootSessionId(sessionID: string): Promise<string> {
+    let current = await this.getSessionV2(sessionID);
+    while (current.parentID) {
+      current = await this.getSessionV2(current.parentID);
+    }
+    return current.id;
+  }
+
+  private async collectSessionTreeForDeletion(rootSessionID: string): Promise<string[]> {
+    const visited = new Set<string>();
+    const order: string[] = [];
+
+    const visit = async (id: string): Promise<void> => {
+      if (visited.has(id)) return;
+      visited.add(id);
+
+      const children = await this.listChildrenV2(id);
+      for (const child of children) {
+        if (child?.id) await visit(child.id);
+      }
+
+      order.push(id);
+    };
+
+    await visit(rootSessionID);
+    return order;
+  }
+
+  async resetSessionGroup(): Promise<{ deletedCount: number; rootSessionID?: string; newSessionID: string }> {
+    const current = this.sessionId;
+    if (!current) {
+      await this.initialize();
+    }
+
+    const sessionID = this.sessionId;
+    if (!sessionID) {
+      const newSessionID = await this.createNewSession();
+      return { deletedCount: 0, newSessionID };
+    }
+
+    const rootSessionID = await this.getRootSessionId(sessionID);
+    const ids = await this.collectSessionTreeForDeletion(rootSessionID);
+
+    const interDeleteDelayMs = 100;
+    let deletedCount = 0;
+    for (const id of ids) {
+      try {
+        await this.deleteSessionV2(id);
+        deletedCount += 1;
+      } catch (error) {
+        console.warn(`[OpencodeGateway] Session delete failed (ignored): ${String(error)}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, interDeleteDelayMs));
+    }
+
+    this.sessionId = null;
+    const newSessionID = await this.createNewSession();
+    return { deletedCount, rootSessionID, newSessionID };
+  }
+
+  async resetCurrentChildSession(): Promise<{ deletedSessionID: string; parentSessionID: string }> {
+    const sessionID = this.sessionId;
+    if (!sessionID) {
+      throw new Error('No active session');
+    }
+
+    const info = await this.getSessionV2(sessionID);
+    const parentSessionID = info.parentID as string | undefined;
+    if (!parentSessionID) {
+      throw new Error('Current session is a root session; use /reset to delete the entire group.');
+    }
+
+    await this.deleteSessionV2(sessionID);
+    this.sessionId = parentSessionID;
+    return { deletedSessionID: sessionID, parentSessionID };
+  }
+
   async createNewSession(): Promise<string> {
     console.log('[OpencodeGateway] Creating new session...');
 
-    const createResult = await this.client.session.create({
+    const createResult = await this.clientV1.session.create({
       body: {},
     });
 
@@ -147,7 +341,7 @@ export class OpencodeGateway {
   }
 
   async getSessionInfo(sessionId: string): Promise<any> {
-    const result = await this.client.session.get({
+    const result = await this.clientV1.session.get({
       path: { id: sessionId },
     });
 
@@ -161,7 +355,7 @@ export class OpencodeGateway {
   async listSessions(): Promise<Array<{ id: string; title?: string; updated?: number; projectID?: string }>> {
     console.log('[OpencodeGateway] Listing sessions...');
 
-    const sessionsResult = await this.client.session.list();
+    const sessionsResult = await this.clientV1.session.list();
     if (sessionsResult.error) {
       throw new Error(`Session list failed: ${String(sessionsResult.error)}`);
     }
@@ -181,7 +375,7 @@ export class OpencodeGateway {
     console.log(`[OpencodeGateway] Switching to session: ${sessionId}`);
 
     // Verify session exists
-    const sessionsResult = await this.client.session.list();
+    const sessionsResult = await this.clientV1.session.list();
     if (sessionsResult.error) {
       throw new Error(`Session list failed: ${String(sessionsResult.error)}`);
     }
@@ -195,5 +389,65 @@ export class OpencodeGateway {
 
     this.sessionId = sessionId;
     console.log(`[OpencodeGateway] Switched to session: ${this.sessionId}`);
+  }
+
+  async listPendingPermissions(): Promise<PendingPermission[]> {
+    const result = await this.clientV2.permission.list({
+      directory: this.directory,
+    });
+
+    if (result.error) {
+      throw new Error(`Permission list failed: ${String(result.error)}`);
+    }
+
+    return (result.data || []) as unknown as PendingPermission[];
+  }
+
+  async replyPermission(requestID: string, reply: 'once' | 'always' | 'reject', message?: string): Promise<void> {
+    const result = await this.clientV2.permission.reply({
+      requestID,
+      directory: this.directory,
+      reply,
+      message,
+    });
+
+    if (result.error) {
+      throw new Error(`Permission reply failed: ${String(result.error)}`);
+    }
+  }
+
+  async listPendingQuestions(): Promise<PendingQuestionRequest[]> {
+    const result = await this.clientV2.question.list({
+      directory: this.directory,
+    });
+
+    if (result.error) {
+      throw new Error(`Question list failed: ${String(result.error)}`);
+    }
+
+    return (result.data || []) as unknown as PendingQuestionRequest[];
+  }
+
+  async replyQuestion(requestID: string, answers: Array<Array<string>>): Promise<void> {
+    const result = await this.clientV2.question.reply({
+      requestID,
+      directory: this.directory,
+      answers,
+    });
+
+    if (result.error) {
+      throw new Error(`Question reply failed: ${String(result.error)}`);
+    }
+  }
+
+  async rejectQuestion(requestID: string): Promise<void> {
+    const result = await this.clientV2.question.reject({
+      requestID,
+      directory: this.directory,
+    });
+
+    if (result.error) {
+      throw new Error(`Question reject failed: ${String(result.error)}`);
+    }
   }
 }
