@@ -6,7 +6,7 @@
 
 ```
 clawdbot-gateway ←┐
-                     ├─ 같은 봇 (8207082508:AAG88bzOuQ5R-0BIfOpRL3JPz4K520Bwo70)
+├─ 같은 봇 (<REDACTED_BOT_TOKEN>)
 oh-my-telegram    ←┘
 ```
 

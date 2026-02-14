@@ -41,7 +41,7 @@ ngrok http 8080
 
 2. .env 수정:
 ```env
-TELEGRAM_BOT_TOKEN=8598173520:AAFOueWt-WkUrKqjj1sUO_oD0Un-t4RcbmI
+TELEGRAM_BOT_TOKEN=<YOUR_BOT_TOKEN>
 ALLOWED_USERS=*
 WEBHOOK_URL=https://your-ngrok-url.ngrok.io/telegram-bot
 POLLING=false

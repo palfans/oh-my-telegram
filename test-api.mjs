@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const botToken = '8598173520:AAFOueWt-WkUrKqjj1sUO_oD0Un-t4RcbmI';
+const botToken = process.env.TELEGRAM_BOT_TOKEN || '<YOUR_BOT_TOKEN>';
 const apiUrl = `https://api.telegram.org/bot${botToken}`;
 
 async function test() {

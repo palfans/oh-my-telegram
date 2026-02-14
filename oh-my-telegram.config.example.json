@@ -1,7 +1,7 @@
 {
   "telegram": {
-    "botToken": "8598173520:AAFOueWt-WkUrKqjj1sUO_oD0Un-t4RcbmI",
-    "allowedUsers": ["990198083"],
+    "botToken": "<YOUR_BOT_TOKEN>",
+    "allowedUsers": ["123456789"],
     "polling": true,
     "inlineKeyboards": {
       "enabled": true,
