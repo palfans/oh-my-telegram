@@ -39,6 +39,10 @@ TELEGRAM_USER_ID=your_telegram_user_id
 # Opencode Configuration (optional, has defaults)
 OPENCODE_SERVER_URL=http://localhost:4096
 OPENCODE_DEFAULT_AGENT=sisyphus
+
+# OpenCode Web UI URL shown in Telegram (optional)
+# Default: http://127.0.0.1:4096
+OPENCODE_WEB_URL=http://127.0.0.1:4096
 ```
 
 **Note:** Only `TELEGRAM_BOT_TOKEN` and `TELEGRAM_USER_ID` are required.
