@@ -896,10 +896,10 @@ export class TelegramBot {
 
       const sessionUrl = this.buildOpencodeSessionWebUrl(newSessionId, projectID);
 
-      await this.sendMarkdownMessage(
+      await this.sendMessage(
         chatId,
-        `✅ *New session created*\n\n` +
-        `Session ID: \`${newSessionId}\`\n\n` +
+        `✅ New session created\n\n` +
+        `Session ID: ${newSessionId}\n\n` +
         `View in opencode web:\n` +
         `${sessionUrl}\n\n` +
         `Starting fresh conversation.`
@@ -1008,9 +1008,15 @@ export class TelegramBot {
     }
 
     // Change working directory
+    const prevPath = session.workingDirectory;
     const newPath = path.startsWith('/') ? path : `${session.workingDirectory}/${path}`;
     session.workingDirectory = newPath;
     session.gateway.setDirectory(newPath);
+
+    if (newPath !== prevPath) {
+      session.opencodeSessionId = null;
+      session.gateway.setSessionId(null);
+    }
 
     await this.sendMarkdownMessage(
       chatId,
