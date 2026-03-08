@@ -3,7 +3,7 @@ import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import MarkdownIt from 'markdown-it';
 
-import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest } from './opencode-gateway.js';
+import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest, type SelectedModel, type AvailableModel } from './opencode-gateway.js';
 import { TaskNotifier, type TaskHandle } from './task-notifier.js';
 import { TelegramStreamingReply } from './telegram-streaming.js';
 
@@ -49,6 +49,7 @@ interface TelegramSession {
   sessionKey: string;
   opencodeSessionId: string | null;
   currentAgent: string;
+  selectedModel?: SelectedModel;
   workingDirectory: string;
   gateway: OpencodeGateway;
   lastUserMessage?: string;
@@ -720,6 +721,7 @@ export class TelegramBot {
         sessionKey,
         opencodeSessionId: null,
         currentAgent: this.config.opencode.defaultAgent,
+        selectedModel: undefined,
         workingDirectory: this.config.opencode.workingDirectory,
         gateway: new OpencodeGateway(this.serverUrl, this.config.opencode.workingDirectory),
         createdAt: new Date(),
@@ -788,6 +790,7 @@ export class TelegramBot {
     message: string,
     session: TelegramSession,
     agent?: string,
+    model?: SelectedModel,
     onText?: (text: string) => void | Promise<void>
   ): Promise<string> {
     // Prepend working directory context if not default
@@ -796,10 +799,102 @@ export class TelegramBot {
       : message;
     
     if (onText) {
-      return session.gateway.streamMessage(contextMessage, { agent, onText });
+      return session.gateway.streamMessage(contextMessage, { agent, model, onText });
     }
 
-    return session.gateway.sendMessage(contextMessage, agent);
+    return session.gateway.sendMessage(contextMessage, agent, model);
+  }
+
+  private resolveAgentForExecution(session: TelegramSession, requestedAgent?: string): string {
+    return requestedAgent || session.currentAgent || this.config.opencode.defaultAgent;
+  }
+
+  private formatSelectedModel(model?: SelectedModel): string {
+    return model ? `${model.providerID}/${model.modelID}` : '(default)';
+  }
+
+  private parseModelSelection(raw: string): SelectedModel | null {
+    const value = raw.trim();
+    const slashIndex = value.indexOf('/');
+    if (slashIndex <= 0 || slashIndex === value.length - 1) {
+      return null;
+    }
+
+    return {
+      providerID: value.slice(0, slashIndex),
+      modelID: value.slice(slashIndex + 1),
+    };
+  }
+
+  private groupAvailableModels(models: AvailableModel[]): Map<string, string[]> {
+    const groups = new Map<string, string[]>();
+    for (const model of models) {
+      const existing = groups.get(model.providerID) || [];
+      existing.push(model.modelID);
+      groups.set(model.providerID, existing);
+    }
+    return groups;
+  }
+
+  private formatAvailableModelsMessage(currentModel: SelectedModel | undefined, defaultModel: string | undefined, models: AvailableModel[]): string {
+    const groups = this.groupAvailableModels(models);
+
+    const lines: string[] = [];
+    lines.push('🧠 *Available Models*');
+    lines.push('');
+    lines.push(`*Current chat model:* \`${this.formatSelectedModel(currentModel)}\``);
+    if (defaultModel) {
+      lines.push(`*OpenCode default:* \`${defaultModel}\``);
+    }
+    lines.push('');
+
+    lines.push('*Providers:*');
+    for (const [providerID, providerModels] of groups.entries()) {
+      lines.push(`• \`${providerID}\` (${providerModels.length} models)`);
+    }
+    lines.push('');
+    lines.push('Use `/models <provider>` to see model IDs for one provider.');
+    lines.push('Use `/models all` to dump the full raw list.');
+    lines.push('Use `/model <provider>/<model>` to set the chat default.');
+    lines.push('Use `/model reset` to go back to the OpenCode default.');
+    return lines.join('\n').trim();
+  }
+
+  private formatProviderModelsMessage(providerID: string, currentModel: SelectedModel | undefined, models: string[]): string {
+    const lines: string[] = [];
+    lines.push(`Models for ${providerID}`);
+    lines.push('');
+    lines.push(`Current chat model: ${this.formatSelectedModel(currentModel)}`);
+    lines.push('');
+
+    for (const modelID of models) {
+      lines.push(`${providerID}/${modelID}`);
+    }
+
+    lines.push('');
+    lines.push(`Use /model ${providerID}/${models[0]} to set one of these models.`);
+    return lines.join('\n').trim();
+  }
+
+  private formatAllModelsMessage(currentModel: SelectedModel | undefined, defaultModel: string | undefined, models: AvailableModel[]): string {
+    const groups = this.groupAvailableModels(models);
+    const lines: string[] = [];
+    lines.push('Available Models');
+    lines.push('');
+    lines.push(`Current chat model: ${this.formatSelectedModel(currentModel)}`);
+    if (defaultModel) {
+      lines.push(`OpenCode default: ${defaultModel}`);
+    }
+    lines.push('');
+
+    for (const [providerID, providerModels] of groups.entries()) {
+      lines.push(`*${providerID}*`);
+      for (const modelID of providerModels) {
+        lines.push(`${providerID}/${modelID}`);
+      }
+      lines.push('');
+    }
+    return lines.join('\n').trim();
   }
 
   /**
@@ -898,6 +993,9 @@ export class TelegramBot {
       '/librarian \\[message\\] - Use librarian agent\n' +
       '/metis \\[message\\] - Use metis agent\n' +
       '/status - Show session status\n' +
+      '/models - List available models\n' +
+      '/model <provider>/<model> - Set chat model\n' +
+      '/model reset - Reset chat model\n' +
       '/new - Create new session\n' +
       '/list - List sessions for this chat\n' +
       '/switch <number> - Switch session (this chat)\n' +
@@ -926,6 +1024,9 @@ export class TelegramBot {
       '• metis - Pre-planning consultant\n\n' +
       'Commands:\n' +
       '/status - Show session status\n' +
+      '/models - List available models\n' +
+      '/model <provider>/<model> - Set chat model\n' +
+      '/model reset - Reset chat model\n' +
       '/new - Create new session\n' +
       '/list - List sessions for this chat\n' +
       '/switch <number> - Switch session (this chat)\n' +
@@ -1013,6 +1114,7 @@ export class TelegramBot {
       '📊 *Bot Status*\n\n' +
       `*Session:* \`${sessionId}\`\n` +
       `*Agent:* ${session.currentAgent}\n` +
+      `*Model:* \`${this.formatSelectedModel(session.selectedModel)}\`\n` +
       `*Working Dir:* \`${session.workingDirectory}\`\n` +
       `*Gateway:* ${gatewayStatus}\n` +
       `*Uptime:* ${uptimeFormatted}\n` +
@@ -1020,6 +1122,85 @@ export class TelegramBot {
       `*Chat created:* ${session.createdAt.toLocaleString()}\n` +
       `*Last activity:* ${session.lastActivity.toLocaleString()}`
     );
+  }
+
+  private async handleModels(chatId: number, filter?: string): Promise<void> {
+    try {
+      const session = this.getSession(chatId);
+      const available = await session.gateway.listAvailableModels();
+      const command = (filter || '').trim();
+
+      if (!command) {
+        await this.sendMarkdownMessage(
+          chatId,
+          this.formatAvailableModelsMessage(session.selectedModel, available.defaultModel, available.models)
+        );
+        return;
+      }
+
+      if (command === 'all') {
+        await this.sendPreMessage(
+          chatId,
+          this.formatAllModelsMessage(session.selectedModel, available.defaultModel, available.models)
+        );
+        return;
+      }
+
+      const groups = this.groupAvailableModels(available.models);
+      const providerModels = groups.get(command);
+      if (!providerModels) {
+        await this.sendMessage(chatId, `⚠️ Unknown provider: ${command}\nUse /models to see available providers.`);
+        return;
+      }
+
+      await this.sendPreMessage(chatId, this.formatProviderModelsMessage(command, session.selectedModel, providerModels));
+    } catch (error) {
+      await this.sendMessage(chatId, `❌ Failed to list models: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  private async handleModel(chatId: number, value?: string): Promise<void> {
+    const session = this.getSession(chatId);
+    const commandValue = (value || '').trim();
+
+    if (!commandValue) {
+      return this.handleModels(chatId);
+    }
+
+    if (commandValue === 'reset' || commandValue === 'clear') {
+      session.selectedModel = undefined;
+      await this.sendMarkdownMessage(
+        chatId,
+        '✅ *Chat model reset*\n\nThis chat will use the OpenCode default model again.'
+      );
+      return;
+    }
+
+    const selectedModel = this.parseModelSelection(commandValue);
+    if (!selectedModel) {
+      await this.sendMessage(chatId, '⚠️ Usage: /model <provider>/<model>\nExample: /model bqqq-gpt/responses/gpt-5.4');
+      return;
+    }
+
+    try {
+      const available = await session.gateway.listAvailableModels();
+      const exists = available.models.some(
+        (model) => model.providerID === selectedModel.providerID && model.modelID === selectedModel.modelID
+      );
+
+      if (!exists) {
+        await this.sendMessage(chatId, `⚠️ Unknown model: ${selectedModel.providerID}/${selectedModel.modelID}\nUse /models to see available values.`);
+        return;
+      }
+
+      session.selectedModel = selectedModel;
+      await this.sendMarkdownMessage(
+        chatId,
+        `✅ *Chat model updated*\n\nCurrent model: \`${selectedModel.providerID}/${selectedModel.modelID}\``
+      );
+    } catch (error) {
+      await this.sendMessage(chatId, `❌ Failed to set model: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private async handleNew(chatId: number): Promise<void> {
@@ -1532,6 +1713,14 @@ export class TelegramBot {
       return this.handleStatus(chatId);
     }
 
+    if (text === '/models' || text.startsWith('/models ')) {
+      return this.handleModels(chatId, text.substring(7).trim() || undefined);
+    }
+
+    if (text === '/model' || text.startsWith('/model ')) {
+      return this.handleModel(chatId, text.substring(6).trim() || undefined);
+    }
+
     if (text === '/new' || text.startsWith('/new ')) {
       return this.handleNew(chatId);
     }
@@ -1578,6 +1767,9 @@ export class TelegramBot {
 
     this.inFlightByChatId.set(chatId, true);
 
+    const effectiveAgent = this.resolveAgentForExecution(session, agent);
+    const effectiveModel = session.selectedModel;
+
     const preview = messageContent.length > 80 ? `${messageContent.slice(0, 80)}…` : messageContent;
     const task = this.notifier.createTask(chatId, `⏳ 已开始处理：\n${preview}`);
     const streamReply = new TelegramStreamingReply({
@@ -1605,7 +1797,7 @@ export class TelegramBot {
         await streamReply.ensurePlaceholder();
         await this.ensureOpencodeSession(session);
         await this.maybeSendPendingInteractions(chatId);
-        const response = await this.executeOpenCode(messageContent, session, agent, (text) => {
+        const response = await this.executeOpenCode(messageContent, session, effectiveAgent, effectiveModel, (text) => {
           streamReply.update(text);
         });
         await this.maybeSendPendingInteractions(chatId);

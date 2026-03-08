@@ -34,9 +34,21 @@ export type PendingQuestionRequest = {
 
 export type OpencodeStreamOptions = {
   agent?: string;
+  model?: SelectedModel;
   onText?: (text: string) => void | Promise<void>;
   pollIntervalMs?: number;
   timeoutMs?: number;
+};
+
+export type SelectedModel = {
+  providerID: string;
+  modelID: string;
+};
+
+export type AvailableModel = SelectedModel & {
+  label: string;
+  providerName: string;
+  modelName: string;
 };
 
 interface OpencodeMessage {
@@ -188,7 +200,7 @@ export class OpencodeGateway {
     console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
   }
 
-  async sendMessage(message: string, agent?: string): Promise<string> {
+  async sendMessage(message: string, agent?: string, model?: SelectedModel): Promise<string> {
     if (!this.sessionId) {
       await this.initialize();
       if (!this.sessionId) {
@@ -200,7 +212,7 @@ export class OpencodeGateway {
 
     const result = await this.clientV1.session.prompt({
       path: { id: this.sessionId },
-      body: this.buildPromptBody(message, agent),
+      body: this.buildPromptBody(message, agent, model),
     });
 
     if (result.error) {
@@ -258,12 +270,12 @@ export class OpencodeGateway {
 
     const accepted = await this.clientV1.session.promptAsync({
       path: { id: this.sessionId },
-      body: this.buildPromptBody(message, options.agent),
+      body: this.buildPromptBody(message, options.agent, options.model),
     });
 
     if (accepted.error) {
       console.warn(`[OpencodeGateway] promptAsync failed, falling back to prompt(): ${String(accepted.error)}`);
-      return this.sendMessage(message, options.agent);
+      return this.sendMessage(message, options.agent, options.model);
     }
 
     let lastText = '';
@@ -607,9 +619,51 @@ export class OpencodeGateway {
     }
   }
 
-  private buildPromptBody(message: string, agent?: string): { parts: Array<{ type: 'text'; text: string }>; agent?: string } {
+  async listAvailableModels(): Promise<{ defaultModel?: string; models: AvailableModel[] }> {
+    const result = await this.clientV1.config.providers({
+      query: { directory: this.directory },
+    });
+
+    if (result.error || !result.data) {
+      throw new Error(`Provider list failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    const providers = result.data.providers || [];
+    const models: AvailableModel[] = [];
+
+    for (const provider of providers) {
+      const providerName = provider.name || provider.id;
+      for (const model of Object.values(provider.models || {})) {
+        models.push({
+          providerID: provider.id,
+          modelID: model.id,
+          label: `${provider.id}/${model.id}`,
+          providerName,
+          modelName: model.id,
+        });
+      }
+    }
+
+    models.sort((a, b) => a.label.localeCompare(b.label));
+
+    return {
+      defaultModel: result.data.default?.model,
+      models,
+    };
+  }
+
+  private buildPromptBody(
+    message: string,
+    agent?: string,
+    model?: SelectedModel
+  ): {
+    parts: Array<{ type: 'text'; text: string }>;
+    agent?: string;
+    model?: SelectedModel;
+  } {
     return {
       ...(agent ? { agent } : {}),
+      ...(model ? { model } : {}),
       parts: [{ type: 'text', text: message }],
     };
   }
