@@ -1,9 +1,11 @@
 import axios, { type AxiosInstance } from 'axios';
 import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import MarkdownIt from 'markdown-it';
 
 import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest } from './opencode-gateway.js';
 import { TaskNotifier, type TaskHandle } from './task-notifier.js';
+import { TelegramStreamingReply } from './telegram-streaming.js';
 
 /**
  * Telegram update structure
@@ -111,7 +113,10 @@ export class TelegramBot {
   private inFlightByChatId: Map<number, boolean> = new Map();
   private taskHandleByChatId: Map<number, TaskHandle> = new Map();
   private taskStageByChatId: Map<number, string> = new Map();
+  private chatWriteQueueByChatId: Map<number, Promise<void>> = new Map();
+  private draftStreamingSupport: { status: 'unknown' | 'supported' | 'unsupported' } = { status: 'unsupported' };
   private notifier: TaskNotifier;
+  private markdownRenderer: MarkdownIt;
   private isRunning: boolean = false;
   private pollingInterval: number = 1000; // ms between polling attempts
   private longPollTimeout: number = 30; // seconds for long polling
@@ -124,6 +129,11 @@ export class TelegramBot {
     this.serverUrl = 'http://localhost:4096';
     this.sessions = new Map();
     this.httpClient = this.createTelegramHttpClient();
+    this.markdownRenderer = new MarkdownIt({
+      html: false,
+      breaks: false,
+      linkify: true,
+    });
 
     this.notifier = new TaskNotifier(
       {
@@ -195,6 +205,49 @@ export class TelegramBot {
     return response.data;
   }
 
+  private enqueueChatWrite<T>(chatId: number, operation: () => Promise<T>): Promise<T> {
+    const previous = this.chatWriteQueueByChatId.get(chatId) ?? Promise.resolve();
+    const queued = previous.catch(() => undefined).then(operation);
+    const sentinel = queued.then(() => undefined, () => undefined);
+    this.chatWriteQueueByChatId.set(chatId, sentinel);
+
+    return queued.finally(() => {
+      if (this.chatWriteQueueByChatId.get(chatId) === sentinel) {
+        this.chatWriteQueueByChatId.delete(chatId);
+      }
+    });
+  }
+
+  private isMessageNotModifiedError(error: unknown): boolean {
+    const text = error instanceof Error ? error.message : String(error);
+    return /message is not modified/i.test(text);
+  }
+
+  private isTelegramParseEntityError(error: unknown): boolean {
+    const text = error instanceof Error ? error.message : String(error);
+    return /can't parse entities|parse entities|can't find end tag|unsupported start tag/i.test(text);
+  }
+
+  private decodeBasicHtmlEntities(text: string): string {
+    return text
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&');
+  }
+
+  private stripTelegramHtml(text: string): string {
+    return this.decodeBasicHtmlEntities(
+      text
+        .replace(/<br\s*\/?>/g, '\n')
+        .replace(/<\/p>/g, '\n\n')
+        .replace(/<\/h[1-6]>/g, '\n')
+        .replace(/<li>/g, '• ')
+        .replace(/<\/li>/g, '\n')
+        .replace(/<[^>]+>/g, '')
+    ).replace(/\n{3,}/g, '\n\n').trim();
+  }
+
   private createTelegramHttpClient(): AxiosInstance {
     const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
     const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
@@ -240,17 +293,20 @@ export class TelegramBot {
   async sendMessage(chatId: number, text: string, options: any = {}): Promise<number | null> {
     const timestamp = new Date().toISOString();
     try {
-      const payload: any = {
-        chat_id: chatId,
-        text,
-        ...options,
-      };
+      const result = await this.enqueueChatWrite(chatId, async () => {
+        const payload: any = {
+          chat_id: chatId,
+          text,
+          ...options,
+        };
 
-      if (payload.parse_mode == null) {
-        delete payload.parse_mode;
-      }
+        if (payload.parse_mode == null) {
+          delete payload.parse_mode;
+        }
 
-      const result = await this.apiCall('sendMessage', payload);
+        return this.apiCall('sendMessage', payload);
+      });
+
       console.log(`[${timestamp}] [bot] sent message to ${chatId} (${text.length} chars)`);
       const messageId = result?.result?.message_id;
       return typeof messageId === 'number' ? messageId : null;
@@ -270,25 +326,75 @@ export class TelegramBot {
 
   private async sendHtmlMessage(chatId: number, text: string, options: any = {}): Promise<void> {
     const { parse_mode, ...rest } = options;
-    await this.sendMessage(chatId, text, {
-      ...rest,
-      parse_mode: parse_mode ?? 'HTML',
-    });
+    try {
+      await this.sendMessage(chatId, text, {
+        ...rest,
+        parse_mode: parse_mode ?? 'HTML',
+      });
+    } catch (error) {
+      if (!this.isTelegramParseEntityError(error)) {
+        throw error;
+      }
+
+      await this.sendMessage(chatId, this.stripTelegramHtml(text), rest);
+    }
+  }
+
+  private async editHtmlMessage(chatId: number, messageId: number, text: string, options: any = {}): Promise<void> {
+    const { parse_mode, ...rest } = options;
+    try {
+      await this.editMessageText(chatId, messageId, text, {
+        ...rest,
+        parse_mode: parse_mode ?? 'HTML',
+      });
+    } catch (error) {
+      if (!this.isTelegramParseEntityError(error)) {
+        throw error;
+      }
+
+      await this.editMessageText(chatId, messageId, this.stripTelegramHtml(text), rest);
+    }
   }
 
   private async editMessageText(chatId: number, messageId: number, text: string, options: any = {}): Promise<void> {
-    const payload: any = {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      ...options,
-    };
+    try {
+      await this.enqueueChatWrite(chatId, async () => {
+        const payload: any = {
+          chat_id: chatId,
+          message_id: messageId,
+          text,
+          ...options,
+        };
 
-    if (payload.parse_mode == null) {
-      delete payload.parse_mode;
+        if (payload.parse_mode == null) {
+          delete payload.parse_mode;
+        }
+
+        await this.apiCall('editMessageText', payload);
+      });
+    } catch (error) {
+      if (this.isMessageNotModifiedError(error)) {
+        return;
+      }
+      throw error;
     }
+  }
 
-    await this.apiCall('editMessageText', payload);
+  private async sendMessageDraft(chatId: number, draftId: number, text: string, options: any = {}): Promise<void> {
+    await this.enqueueChatWrite(chatId, async () => {
+      const payload: any = {
+        chat_id: chatId,
+        draft_id: draftId,
+        text,
+        ...options,
+      };
+
+      if (payload.parse_mode == null) {
+        delete payload.parse_mode;
+      }
+
+      await this.apiCall('sendMessageDraft', payload);
+    });
   }
 
   private escapeHtml(text: string): string {
@@ -356,10 +462,16 @@ export class TelegramBot {
     return this.chunkRawForHtmlWrapper(raw, '<pre>', '</pre>', maxPayloadLength);
   }
 
-  private async sendPreMessage(chatId: number, raw: string, options: any = {}): Promise<number> {
+  private async sendPreMessage(chatId: number, raw: string, options: any = {}, existingMessageId?: number | null): Promise<number> {
     const chunks = this.chunkRawForHtmlPre(raw);
-    for (const chunk of chunks) {
-      await this.sendHtmlMessage(chatId, this.formatPreHtml(chunk), options);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const html = this.formatPreHtml(chunk);
+      if (i === 0 && typeof existingMessageId === 'number') {
+        await this.editHtmlMessage(chatId, existingMessageId, html, options);
+      } else {
+        await this.sendHtmlMessage(chatId, html, options);
+      }
     }
 
     return chunks.length;
@@ -414,78 +526,55 @@ export class TelegramBot {
     return blocks;
   }
 
-  private formatInlineMarkdownToHtml(text: string): string {
-    let out = '';
-    let i = 0;
+  private normalizeMarkdownHtmlForTelegram(markdown: string): string {
+    const rendered = this.markdownRenderer.render(markdown);
 
-    while (i < text.length) {
-      if (text[i] === '`') {
-        const end = text.indexOf('`', i + 1);
-        if (end !== -1) {
-          const raw = text.slice(i + 1, end);
-          out += `<code>${this.escapeHtml(raw)}</code>`;
-          i = end + 1;
-          continue;
-        }
-      }
-
-      if (text.startsWith('**', i)) {
-        const end = text.indexOf('**', i + 2);
-        if (end !== -1) {
-          const raw = text.slice(i + 2, end);
-          out += `<b>${this.formatInlineMarkdownToHtml(raw)}</b>`;
-          i = end + 2;
-          continue;
-        }
-      }
-
-      if (text[i] === '[') {
-        const mid = text.indexOf('](', i + 1);
-        if (mid !== -1) {
-          const end = text.indexOf(')', mid + 2);
-          if (end !== -1) {
-            const labelRaw = text.slice(i + 1, mid);
-            const urlRaw = text.slice(mid + 2, end);
-            const label = this.formatInlineMarkdownToHtml(labelRaw);
-            const url = this.escapeHtmlAttribute(urlRaw);
-            out += `<a href="${url}">${label}</a>`;
-            i = end + 1;
-            continue;
-          }
-        }
-      }
-
-      out += this.escapeHtml(text[i]);
-      i += 1;
-    }
-
-    return out;
+    return rendered
+      .replace(/<(?:strong)>/g, '<b>')
+      .replace(/<\/(?:strong)>/g, '</b>')
+      .replace(/<(?:em)>/g, '<i>')
+      .replace(/<\/(?:em)>/g, '</i>')
+      .replace(/<(?:s)>/g, '<s>')
+      .replace(/<\/(?:s)>/g, '</s>')
+      .replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/g, '<b>$1</b>\n')
+      .replace(/<hr\s*\/?>/g, '──────────\n')
+      .replace(/<blockquote>([\s\S]*?)<\/blockquote>/g, (_match: string, inner: string) => {
+        const text = String(inner)
+          .split('\n')
+          .map((line) => line.trim().length > 0 ? `│ ${line}` : '│')
+          .join('\n');
+        return `${text}\n`;
+      })
+      .replace(/<ul>\s*/g, '')
+      .replace(/\s*<\/ul>/g, '\n')
+      .replace(/<ol>\s*/g, '')
+      .replace(/\s*<\/ol>/g, '\n')
+      .replace(/<li>([\s\S]*?)<\/li>/g, '• $1\n')
+      .replace(/<p>([\s\S]*?)<\/p>/g, '$1\n\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
-  private formatTextBlockMarkdownToHtml(raw: string): string {
-    const lines = raw.split('\n');
-    const rendered = lines.map(line => {
-      const m = line.match(/^(\s*)[-*]\s+(.*)$/);
-      if (m) {
-        const indent = m[1] || '';
-        const body = m[2] || '';
-        return `${this.escapeHtml(indent)}• ${this.formatInlineMarkdownToHtml(body)}`;
-      }
-      return this.formatInlineMarkdownToHtml(line);
-    });
-    return rendered.join('\n');
-  }
-
-  private async sendMarkdownAsTelegramHtml(chatId: number, markdown: string, options: any = {}): Promise<number> {
+  private async sendMarkdownAsTelegramHtml(chatId: number, markdown: string, options: any = {}, existingMessageId?: number | null): Promise<number> {
     const maxPayloadLength = 4000;
     const blocks = this.parseMarkdownCodeBlocks(markdown);
     let pending = '';
     let sentCount = 0;
+    let firstChunkConsumed = false;
+
+    const deliverHtml = async (html: string) => {
+      if (!firstChunkConsumed && typeof existingMessageId === 'number') {
+        await this.editHtmlMessage(chatId, existingMessageId, html, options);
+      } else {
+        await this.sendHtmlMessage(chatId, html, options);
+      }
+      firstChunkConsumed = true;
+      sentCount += 1;
+    };
 
     const flushPending = async () => {
       if (!pending) return;
-      await this.sendHtmlMessage(chatId, pending, options);
-      sentCount += 1;
+      await deliverHtml(pending);
       pending = '';
     };
 
@@ -500,13 +589,12 @@ export class TelegramBot {
 
         const codeChunks = this.chunkRawForHtmlWrapper(b.raw, wrapPrefix, wrapSuffix, maxPayloadLength);
         for (const c of codeChunks) {
-          await this.sendHtmlMessage(chatId, wrapPrefix + this.escapeHtml(c) + wrapSuffix, options);
-          sentCount += 1;
+          await deliverHtml(wrapPrefix + this.escapeHtml(c) + wrapSuffix);
         }
         continue;
       }
 
-      const html = this.formatTextBlockMarkdownToHtml(b.raw);
+      const html = this.normalizeMarkdownHtmlForTelegram(b.raw);
       const piece = pending ? `${pending}\n\n${html}` : html;
       if (piece.length <= maxPayloadLength) {
         pending = piece;
@@ -519,11 +607,58 @@ export class TelegramBot {
         continue;
       }
 
-      const count = await this.sendPreMessage(chatId, b.raw, options);
+      const count = await this.sendPreMessage(
+        chatId,
+        b.raw,
+        options,
+        !firstChunkConsumed ? existingMessageId : undefined
+      );
+      firstChunkConsumed = true;
       sentCount += count;
     }
 
     await flushPending();
+    return sentCount;
+  }
+
+  private async sendPlainTextChunks(chatId: number, text: string, existingMessageId?: number | null): Promise<number> {
+    const maxPayloadLength = 4000;
+    const chunks: string[] = [];
+
+    let remaining = text;
+    while (remaining.length > 0) {
+      if (remaining.length <= maxPayloadLength) {
+        chunks.push(remaining);
+        break;
+      }
+
+      let splitAt = remaining.lastIndexOf('\n', maxPayloadLength);
+      if (splitAt < maxPayloadLength / 2) {
+        splitAt = remaining.lastIndexOf(' ', maxPayloadLength);
+      }
+      if (splitAt < maxPayloadLength / 2) {
+        splitAt = maxPayloadLength;
+      }
+
+      chunks.push(remaining.slice(0, splitAt).trimEnd());
+      remaining = remaining.slice(splitAt).trimStart();
+    }
+
+    if (chunks.length === 0) {
+      chunks.push('[No text response from agent]');
+    }
+
+    let sentCount = 0;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      if (i === 0 && typeof existingMessageId === 'number') {
+        await this.editMessageText(chatId, existingMessageId, chunk);
+      } else {
+        await this.sendMessage(chatId, chunk);
+      }
+      sentCount += 1;
+    }
+
     return sentCount;
   }
 
@@ -546,9 +681,11 @@ export class TelegramBot {
    */
   private async deleteMessage(chatId: number, messageId: number): Promise<void> {
     try {
-      await this.apiCall('deleteMessage', {
-        chat_id: chatId,
-        message_id: messageId,
+      await this.enqueueChatWrite(chatId, async () => {
+        await this.apiCall('deleteMessage', {
+          chat_id: chatId,
+          message_id: messageId,
+        });
       });
     } catch (error) {
       // Non-critical, log and continue
@@ -650,14 +787,19 @@ export class TelegramBot {
   private async executeOpenCode(
     message: string,
     session: TelegramSession,
-    agent?: string
+    agent?: string,
+    onText?: (text: string) => void | Promise<void>
   ): Promise<string> {
     // Prepend working directory context if not default
     const contextMessage = session.workingDirectory !== this.config.opencode.workingDirectory
       ? `[Working in: ${session.workingDirectory}]\n\n${message}`
       : message;
     
-    return session.gateway.sendMessage(contextMessage);
+    if (onText) {
+      return session.gateway.streamMessage(contextMessage, { agent, onText });
+    }
+
+    return session.gateway.sendMessage(contextMessage, agent);
   }
 
   /**
@@ -1438,6 +1580,17 @@ export class TelegramBot {
 
     const preview = messageContent.length > 80 ? `${messageContent.slice(0, 80)}…` : messageContent;
     const task = this.notifier.createTask(chatId, `⏳ 已开始处理：\n${preview}`);
+    const streamReply = new TelegramStreamingReply({
+      chatId,
+      messenger: {
+        sendMessage: (targetChatId, text, options) => this.sendMessage(targetChatId, text, options),
+        editMessageText: (targetChatId, messageId, text, options) => this.editMessageText(targetChatId, messageId, text, options),
+        sendMessageDraft: (targetChatId, draftId, text, options) => this.sendMessageDraft(targetChatId, draftId, text, options),
+        deleteMessage: (targetChatId, messageId) => this.deleteMessage(targetChatId, messageId),
+        log: (message, error) => console.warn(message, error),
+      },
+      draftSupport: this.draftStreamingSupport,
+    });
     this.taskHandleByChatId.set(chatId, task);
     this.taskStageByChatId.set(chatId, 'running');
 
@@ -1449,15 +1602,25 @@ export class TelegramBot {
     void (async () => {
       const timestamp = new Date().toISOString();
       try {
+        await streamReply.ensurePlaceholder();
         await this.ensureOpencodeSession(session);
         await this.maybeSendPendingInteractions(chatId);
-        const response = await this.executeOpenCode(messageContent, session, agent);
+        const response = await this.executeOpenCode(messageContent, session, agent, (text) => {
+          streamReply.update(text);
+        });
         await this.maybeSendPendingInteractions(chatId);
-        const msgCount = await this.sendMarkdownAsTelegramHtml(chatId, response);
+        if (!streamReply.hasMeaningfulStreaming()) {
+          await streamReply.revealFinalText(response);
+        }
+
+        const previewMessageId = streamReply.getPersistentMessageId();
+        await streamReply.stopKeepingPreview();
+        const msgCount = await this.sendMarkdownAsTelegramHtml(chatId, response, {}, previewMessageId);
         await task.complete('✅ 已完成');
         console.log(`[${timestamp}] [bot] response sent (${msgCount} messages, ${response.length} chars)`);
       } catch (error: any) {
         console.error(`[${timestamp}] [bot] execution error:`, error);
+        await streamReply.fail();
 
         if (this.isOpencodeConnectivityError(error)) {
           await this.sendMessage(chatId, this.formatOpencodeUnavailableMessage(session, error));
