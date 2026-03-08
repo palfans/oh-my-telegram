@@ -3,7 +3,7 @@ import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import MarkdownIt from 'markdown-it';
 
-import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest, type SelectedModel, type AvailableModel } from './opencode-gateway.js';
+import { OpencodeGateway, type PendingPermission, type PendingQuestionRequest, type SelectedModel, type AvailableModel, type AvailableMcpServer } from './opencode-gateway.js';
 import { TaskNotifier, type TaskHandle } from './task-notifier.js';
 import { TelegramStreamingReply } from './telegram-streaming.js';
 
@@ -50,11 +50,19 @@ interface TelegramSession {
   opencodeSessionId: string | null;
   currentAgent: string;
   selectedModel?: SelectedModel;
+  toolPolicy: Record<string, boolean>;
   workingDirectory: string;
   gateway: OpencodeGateway;
   lastUserMessage?: string;
   createdAt: Date;
   lastActivity: Date;
+}
+
+interface ExecutionOverrides {
+  agent?: string;
+  model?: SelectedModel;
+  tools?: Record<string, boolean>;
+  promptPrefix?: string;
 }
 
 /**
@@ -242,6 +250,14 @@ export class TelegramBot {
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<\/?div>/gi, '\n')
       .replace(/<\/?span>/gi, '')
+      .replace(/<ul\b[^>]*>/gi, '')
+      .replace(/<\/ul>/gi, '\n')
+      .replace(/<ol\b[^>]*>/gi, '')
+      .replace(/<\/ol>/gi, '\n')
+      .replace(/<li\b[^>]*>/gi, '• ')
+      .replace(/<\/li>/gi, '\n')
+      .replace(/<p\b[^>]*>/gi, '')
+      .replace(/<\/p>/gi, '\n\n')
       .replace(/<code class="language-[^"]*">/gi, '<code>')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
@@ -558,18 +574,31 @@ export class TelegramBot {
           .join('\n');
         return `${text}\n`;
       })
-      .replace(/<ul>\s*/g, '')
-      .replace(/\s*<\/ul>/g, '\n')
-      .replace(/<ol>\s*/g, '')
-      .replace(/\s*<\/ol>/g, '\n')
-      .replace(/<li>([\s\S]*?)<\/li>/g, '• $1\n')
-      .replace(/<p>([\s\S]*?)<\/p>/g, '$1\n\n')
+      .replace(/<ul\b[^>]*>/gi, '')
+      .replace(/<\/ul>/gi, '\n')
+      .replace(/<ol\b[^>]*>/gi, '')
+      .replace(/<\/ol>/gi, '\n')
+      .replace(/<li\b[^>]*>/gi, '• ')
+      .replace(/<\/li>/gi, '\n')
+      .replace(/<p\b[^>]*>/gi, '')
+      .replace(/<\/p>/gi, '\n\n')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
 
   private async sendMarkdownAsTelegramHtml(chatId: number, markdown: string, options: any = {}, existingMessageId?: number | null): Promise<number> {
     const maxPayloadLength = 4000;
+    const fullHtml = this.normalizeMarkdownHtmlForTelegram(markdown);
+
+    if (fullHtml.length > 0 && fullHtml.length <= maxPayloadLength) {
+      if (typeof existingMessageId === 'number') {
+        await this.editHtmlMessage(chatId, existingMessageId, fullHtml, options);
+      } else {
+        await this.sendHtmlMessage(chatId, fullHtml, options);
+      }
+      return 1;
+    }
+
     const blocks = this.parseMarkdownCodeBlocks(markdown);
     let pending = '';
     let sentCount = 0;
@@ -591,10 +620,25 @@ export class TelegramBot {
       pending = '';
     };
 
+    const queueHtmlPiece = async (html: string) => {
+      const piece = pending ? `${pending}\n\n${html}` : html;
+      if (piece.length <= maxPayloadLength) {
+        pending = piece;
+        return;
+      }
+
+      await flushPending();
+
+      if (html.length <= maxPayloadLength) {
+        pending = html;
+        return;
+      }
+
+      await deliverHtml(html);
+    };
+
     for (const b of blocks) {
       if (b.kind === 'code') {
-        await flushPending();
-
         const safeLang = (b.lang || '').match(/^[a-zA-Z0-9_+-]{1,32}$/) ? b.lang : undefined;
         const classAttr = safeLang ? ` class="language-${this.escapeHtmlAttribute(safeLang)}"` : '';
         const wrapPrefix = `<pre><code${classAttr}>`;
@@ -602,7 +646,7 @@ export class TelegramBot {
 
         const codeChunks = this.chunkRawForHtmlWrapper(b.raw, wrapPrefix, wrapSuffix, maxPayloadLength);
         for (const c of codeChunks) {
-          await deliverHtml(wrapPrefix + this.escapeHtml(c) + wrapSuffix);
+          await queueHtmlPiece(wrapPrefix + this.escapeHtml(c) + wrapSuffix);
         }
         continue;
       }
@@ -734,6 +778,7 @@ export class TelegramBot {
         opencodeSessionId: null,
         currentAgent: this.config.opencode.defaultAgent,
         selectedModel: undefined,
+        toolPolicy: {},
         workingDirectory: this.config.opencode.workingDirectory,
         gateway: new OpencodeGateway(this.serverUrl, this.config.opencode.workingDirectory),
         createdAt: new Date(),
@@ -803,18 +848,22 @@ export class TelegramBot {
     session: TelegramSession,
     agent?: string,
     model?: SelectedModel,
+    tools?: Record<string, boolean>,
+    promptPrefix?: string,
     onText?: (text: string) => void | Promise<void>
   ): Promise<string> {
     // Prepend working directory context if not default
-    const contextMessage = session.workingDirectory !== this.config.opencode.workingDirectory
+    const baseMessage = session.workingDirectory !== this.config.opencode.workingDirectory
       ? `[Working in: ${session.workingDirectory}]\n\n${message}`
       : message;
+
+    const contextMessage = promptPrefix ? `${promptPrefix}\n\n${baseMessage}` : baseMessage;
     
     if (onText) {
-      return session.gateway.streamMessage(contextMessage, { agent, model, onText });
+      return session.gateway.streamMessage(contextMessage, { agent, model, tools, onText });
     }
 
-    return session.gateway.sendMessage(contextMessage, agent, model);
+    return session.gateway.sendMessage(contextMessage, agent, model, tools);
   }
 
   private resolveAgentForExecution(session: TelegramSession, requestedAgent?: string): string {
@@ -823,6 +872,49 @@ export class TelegramBot {
 
   private formatSelectedModel(model?: SelectedModel): string {
     return model ? `${model.providerID}/${model.modelID}` : '(default)';
+  }
+
+  private formatToolPolicySummary(toolPolicy: Record<string, boolean>): string {
+    const disabled = Object.entries(toolPolicy)
+      .filter(([, enabled]) => enabled === false)
+      .map(([toolId]) => toolId)
+      .sort();
+
+    if (disabled.length === 0) {
+      return 'default';
+    }
+
+    return `disabled: ${disabled.join(', ')}`;
+  }
+
+  private inferToolIdsForServer(serverName: string, toolIds: string[]): string[] {
+    const normalized = serverName.trim().toLowerCase();
+
+    return toolIds.filter((toolId) => {
+      const current = toolId.toLowerCase();
+      return current === normalized
+        || current.startsWith(`${normalized}_`)
+        || current.startsWith(`${normalized}-`)
+        || current.startsWith(`${normalized}.`)
+        || current.startsWith(`${normalized}/`);
+    }).sort((a, b) => a.localeCompare(b));
+  }
+
+  private mergeToolPolicies(basePolicy: Record<string, boolean>, overridePolicy?: Record<string, boolean>): Record<string, boolean> {
+    return {
+      ...basePolicy,
+      ...(overridePolicy || {}),
+    };
+  }
+
+  private buildStrictServerToolPolicy(allToolIds: string[], allowedToolIds: string[], basePolicy: Record<string, boolean>): Record<string, boolean> {
+    const strictPolicy: Record<string, boolean> = {};
+
+    for (const toolId of allToolIds) {
+      strictPolicy[toolId] = allowedToolIds.includes(toolId);
+    }
+
+    return this.mergeToolPolicies(strictPolicy, basePolicy);
   }
 
   private parseModelSelection(raw: string): SelectedModel | null {
@@ -906,6 +998,117 @@ export class TelegramBot {
       }
       lines.push('');
     }
+    return lines.join('\n').trim();
+  }
+
+  private formatMcpSummaryMessage(servers: AvailableMcpServer[], toolPolicy: Record<string, boolean>, toolIds: string[]): string {
+    const disabled = Object.entries(toolPolicy)
+      .filter(([, enabled]) => enabled === false)
+      .map(([toolId]) => toolId)
+      .sort();
+
+    const lines: string[] = [];
+    lines.push('🧰 *MCP / Tool Policy*');
+    lines.push('');
+    lines.push('*MCP servers:*');
+    for (const server of servers) {
+      const status = server.status === 'connected' ? 'connected' : server.status;
+      lines.push(`• \`${server.name}\` — ${status}`);
+    }
+    if (servers.length === 0) {
+      lines.push('• none');
+    }
+    lines.push('');
+    lines.push(`*Current chat policy:* ${disabled.length === 0 ? 'default' : `disabled ${disabled.length} tool(s)`}`);
+    if (disabled.length > 0) {
+      for (const toolId of disabled.slice(0, 10)) {
+        lines.push(`• off: \`${toolId}\``);
+      }
+      if (disabled.length > 10) {
+        lines.push(`• ...and ${disabled.length - 10} more`);
+      }
+    }
+    lines.push('');
+    lines.push(`*Available tools:* ${toolIds.length}`);
+    lines.push('');
+    lines.push('Use `/mcp servers` to list MCP servers in plain text.');
+    lines.push('Use `/mcp tools` or `/mcp all` to list tool IDs.');
+    lines.push('Use `/mcp off <toolId>` to disable a tool for this chat.');
+    lines.push('Use `/mcp on <toolId>` to re-enable a tool for this chat.');
+    lines.push('Use `/mcp reset` to clear chat-specific tool overrides.');
+    return lines.join('\n').trim();
+  }
+
+  private formatMcpServerList(servers: AvailableMcpServer[]): string {
+    const lines: string[] = [];
+    lines.push('MCP servers');
+    lines.push('');
+
+    for (const server of servers) {
+      lines.push(`${server.name}: ${server.status}`);
+      if (server.error) {
+        lines.push(`  error: ${server.error}`);
+      }
+    }
+
+    if (servers.length === 0) {
+      lines.push('none');
+    }
+
+    return lines.join('\n').trim();
+  }
+
+  private async handleMcpPrompt(chatId: number, serverName: string, prompt: string, servers: AvailableMcpServer[], toolIds: string[]): Promise<void> {
+    const session = this.getSession(chatId);
+    const server = servers.find((entry) => entry.name === serverName);
+
+    if (!server) {
+      await this.sendMessage(chatId, `⚠️ Unknown MCP server: ${serverName}\nUse /mcp servers to see connected servers.`);
+      return;
+    }
+
+    if (server.status !== 'connected') {
+      await this.sendMessage(chatId, `⚠️ MCP server ${serverName} is not ready (status: ${server.status}).`);
+      return;
+    }
+
+    const matchedToolIds = this.inferToolIdsForServer(serverName, toolIds);
+    const isStrict = matchedToolIds.length > 0;
+    const toolsOverride = isStrict
+      ? this.buildStrictServerToolPolicy(toolIds, matchedToolIds, session.toolPolicy)
+      : undefined;
+    const promptPrefix = isStrict
+      ? `MCP routing mode: strict. For this request, only use tools associated with MCP server \"${serverName}\" for external tool calls. If that server cannot satisfy the request, say so instead of switching to another MCP server.`
+      : `MCP routing mode: best effort. Prefer MCP server \"${serverName}\" if tools are needed. If you cannot satisfy the request through that server, say so briefly instead of pretending it was used.`;
+
+    await this.sendMarkdownMessage(
+      chatId,
+      isStrict
+        ? `🧭 *MCP route*\n\nServer: \`${serverName}\`\nMode: *strict*\nMatched tools: \`${matchedToolIds.join(', ')}\``
+        : `🧭 *MCP route*\n\nServer: \`${serverName}\`\nMode: *best effort*\nReason: no exact tool mapping was found for this server, so this request will use a routing hint only.`
+    );
+
+    session.lastUserMessage = prompt;
+    this.startOpenCodeExecution(chatId, prompt, session, {
+      agent: session.currentAgent,
+      model: session.selectedModel,
+      tools: toolsOverride,
+      promptPrefix,
+    });
+  }
+
+  private formatMcpToolList(toolIds: string[], toolPolicy: Record<string, boolean>): string {
+    const lines: string[] = [];
+    lines.push('Available tool IDs');
+    lines.push('');
+    lines.push(`Current policy: ${this.formatToolPolicySummary(toolPolicy)}`);
+    lines.push('');
+
+    for (const toolId of toolIds) {
+      const enabled = toolPolicy[toolId] !== false;
+      lines.push(`${enabled ? 'on ' : 'off'} ${toolId}`);
+    }
+
     return lines.join('\n').trim();
   }
 
@@ -1008,6 +1211,13 @@ export class TelegramBot {
       '/models - List available models\n' +
       '/model <provider>/<model> - Set chat model\n' +
       '/model reset - Reset chat model\n' +
+      '/mcp - Show chat tool policy\n' +
+      '/mcp servers - List MCP servers\n' +
+      '/mcp tools - List tool IDs\n' +
+      '/mcp all - List tool IDs\n' +
+      '/mcp off <toolId> - Disable tool for this chat\n' +
+      '/mcp on <toolId> - Re-enable tool for this chat\n' +
+      '/mcp reset - Reset tool policy\n' +
       '/new - Create new session\n' +
       '/list - List sessions for this chat\n' +
       '/switch <number> - Switch session (this chat)\n' +
@@ -1039,6 +1249,13 @@ export class TelegramBot {
       '/models - List available models\n' +
       '/model <provider>/<model> - Set chat model\n' +
       '/model reset - Reset chat model\n' +
+      '/mcp - Show chat tool policy\n' +
+      '/mcp servers - List MCP servers\n' +
+      '/mcp tools - List tool IDs\n' +
+      '/mcp all - List tool IDs\n' +
+      '/mcp off <toolId> - Disable tool for this chat\n' +
+      '/mcp on <toolId> - Re-enable tool for this chat\n' +
+      '/mcp reset - Reset tool policy\n' +
       '/new - Create new session\n' +
       '/list - List sessions for this chat\n' +
       '/switch <number> - Switch session (this chat)\n' +
@@ -1127,6 +1344,7 @@ export class TelegramBot {
       `*Session:* \`${sessionId}\`\n` +
       `*Agent:* ${session.currentAgent}\n` +
       `*Model:* \`${this.formatSelectedModel(session.selectedModel)}\`\n` +
+      `*Tools:* ${this.formatToolPolicySummary(session.toolPolicy)}\n` +
       `*Working Dir:* \`${session.workingDirectory}\`\n` +
       `*Gateway:* ${gatewayStatus}\n` +
       `*Uptime:* ${uptimeFormatted}\n` +
@@ -1212,6 +1430,71 @@ export class TelegramBot {
       );
     } catch (error) {
       await this.sendMessage(chatId, `❌ Failed to set model: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  private async handleMcp(chatId: number, value?: string): Promise<void> {
+    const session = this.getSession(chatId);
+    const commandValue = (value || '').trim();
+
+    try {
+      const servers = await session.gateway.listMcpServers();
+      const toolIds = await session.gateway.listAvailableToolIds();
+
+      if (!commandValue) {
+        await this.sendMarkdownMessage(chatId, this.formatMcpSummaryMessage(servers, session.toolPolicy, toolIds));
+        return;
+      }
+
+      if (commandValue === 'servers') {
+        await this.sendPreMessage(chatId, this.formatMcpServerList(servers));
+        return;
+      }
+
+      if (commandValue === 'all' || commandValue === 'tools') {
+        await this.sendPreMessage(chatId, this.formatMcpToolList(toolIds, session.toolPolicy));
+        return;
+      }
+
+      if (commandValue === 'reset') {
+        session.toolPolicy = {};
+        await this.sendMarkdownMessage(chatId, '✅ *Chat tool policy reset*\n\nAll tools are back to the OpenCode default behavior.');
+        return;
+      }
+
+      const [serverCandidate, ...promptParts] = commandValue.split(/\s+/);
+      const prompt = promptParts.join(' ').trim();
+      const knownServer = servers.find((entry) => entry.name === serverCandidate);
+      if (knownServer && prompt) {
+        await this.handleMcpPrompt(chatId, serverCandidate, prompt, servers, toolIds);
+        return;
+      }
+
+      const [action, ...rest] = commandValue.split(/\s+/);
+      const toolId = rest.join(' ').trim();
+
+      if ((action !== 'on' && action !== 'off') || !toolId) {
+        await this.sendMessage(chatId, '⚠️ Usage: /mcp on <toolId> | /mcp off <toolId> | /mcp all | /mcp reset');
+        return;
+      }
+
+      if (!toolIds.includes(toolId)) {
+        await this.sendMessage(chatId, `⚠️ Unknown tool: ${toolId}\nUse /mcp all to see available tool IDs.`);
+        return;
+      }
+
+      if (action === 'on') {
+        delete session.toolPolicy[toolId];
+      } else {
+        session.toolPolicy[toolId] = false;
+      }
+
+      await this.sendMarkdownMessage(
+        chatId,
+        `✅ *Chat tool policy updated*\n\nTool: \`${toolId}\`\nState: *${action === 'on' ? 'enabled' : 'disabled'}*\n\nCurrent policy: ${this.formatToolPolicySummary(session.toolPolicy)}`
+      );
+    } catch (error) {
+      await this.sendMessage(chatId, `❌ Failed to manage MCP/tool policy: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -1621,7 +1904,7 @@ export class TelegramBot {
           await this.deleteMessage(chatId, message.message_id);
         }
 
-        this.startOpenCodeExecution(chatId, session.lastUserMessage, session, undefined);
+        this.startOpenCodeExecution(chatId, session.lastUserMessage, session);
         void this.updateTaskStage(chatId, 'running');
 
         return;
@@ -1733,6 +2016,10 @@ export class TelegramBot {
       return this.handleModel(chatId, text.substring(6).trim() || undefined);
     }
 
+    if (text === '/mcp' || text.startsWith('/mcp ')) {
+      return this.handleMcp(chatId, text.substring(4).trim() || undefined);
+    }
+
     if (text === '/new' || text.startsWith('/new ')) {
       return this.handleNew(chatId);
     }
@@ -1768,10 +2055,10 @@ export class TelegramBot {
     console.log(`[${timestamp}] [bot] user ${userId} (agent: ${session.currentAgent}): ${messageContent.substring(0, 50)}...`);
     session.lastUserMessage = messageContent;
 
-    this.startOpenCodeExecution(chatId, messageContent, session, agent || undefined);
+    this.startOpenCodeExecution(chatId, messageContent, session, { agent: agent || undefined });
   }
 
-  private startOpenCodeExecution(chatId: number, messageContent: string, session: TelegramSession, agent?: string): void {
+  private startOpenCodeExecution(chatId: number, messageContent: string, session: TelegramSession, executionOverrides: ExecutionOverrides = {}): void {
     if (this.inFlightByChatId.get(chatId)) {
       void this.sendMessage(chatId, '⏳ 正在处理上一条请求，请稍后或等待按钮提示。');
       return;
@@ -1779,8 +2066,10 @@ export class TelegramBot {
 
     this.inFlightByChatId.set(chatId, true);
 
-    const effectiveAgent = this.resolveAgentForExecution(session, agent);
-    const effectiveModel = session.selectedModel;
+    const effectiveAgent = this.resolveAgentForExecution(session, executionOverrides.agent);
+    const effectiveModel = executionOverrides.model ?? session.selectedModel;
+    const effectiveTools = this.mergeToolPolicies(session.toolPolicy, executionOverrides.tools);
+    const promptPrefix = executionOverrides.promptPrefix;
 
     const preview = messageContent.length > 80 ? `${messageContent.slice(0, 80)}…` : messageContent;
     const task = this.notifier.createTask(chatId, `⏳ 已开始处理：\n${preview}`);
@@ -1810,7 +2099,7 @@ export class TelegramBot {
         await streamReply.ensurePlaceholder();
         await this.ensureOpencodeSession(session);
         await this.maybeSendPendingInteractions(chatId);
-        const response = await this.executeOpenCode(messageContent, session, effectiveAgent, effectiveModel, (text) => {
+        const response = await this.executeOpenCode(messageContent, session, effectiveAgent, effectiveModel, effectiveTools, promptPrefix, (text) => {
           streamReply.update(text);
         });
         await this.maybeSendPendingInteractions(chatId);

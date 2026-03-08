@@ -35,6 +35,7 @@ export type PendingQuestionRequest = {
 export type OpencodeStreamOptions = {
   agent?: string;
   model?: SelectedModel;
+  tools?: Record<string, boolean>;
   onText?: (text: string) => void | Promise<void>;
   pollIntervalMs?: number;
   timeoutMs?: number;
@@ -49,6 +50,12 @@ export type AvailableModel = SelectedModel & {
   label: string;
   providerName: string;
   modelName: string;
+};
+
+export type AvailableMcpServer = {
+  name: string;
+  status: 'connected' | 'disabled' | 'failed' | 'needs_auth' | 'needs_client_registration';
+  error?: string;
 };
 
 interface OpencodeMessage {
@@ -200,7 +207,7 @@ export class OpencodeGateway {
     console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
   }
 
-  async sendMessage(message: string, agent?: string, model?: SelectedModel): Promise<string> {
+  async sendMessage(message: string, agent?: string, model?: SelectedModel, tools?: Record<string, boolean>): Promise<string> {
     if (!this.sessionId) {
       await this.initialize();
       if (!this.sessionId) {
@@ -212,7 +219,7 @@ export class OpencodeGateway {
 
     const result = await this.clientV1.session.prompt({
       path: { id: this.sessionId },
-      body: this.buildPromptBody(message, agent, model),
+      body: this.buildPromptBody(message, agent, model, tools),
     });
 
     if (result.error) {
@@ -270,12 +277,12 @@ export class OpencodeGateway {
 
     const accepted = await this.clientV1.session.promptAsync({
       path: { id: this.sessionId },
-      body: this.buildPromptBody(message, options.agent, options.model),
+      body: this.buildPromptBody(message, options.agent, options.model, options.tools),
     });
 
     if (accepted.error) {
       console.warn(`[OpencodeGateway] promptAsync failed, falling back to prompt(): ${String(accepted.error)}`);
-      return this.sendMessage(message, options.agent, options.model);
+      return this.sendMessage(message, options.agent, options.model, options.tools);
     }
 
     let lastText = '';
@@ -652,18 +659,51 @@ export class OpencodeGateway {
     };
   }
 
+  async listAvailableToolIds(): Promise<string[]> {
+    const result = await this.clientV1.tool.ids({
+      query: { directory: this.directory },
+    });
+
+    if (result.error || !result.data) {
+      throw new Error(`Tool list failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return [...result.data].sort((a, b) => a.localeCompare(b));
+  }
+
+  async listMcpServers(): Promise<AvailableMcpServer[]> {
+    const result = await this.clientV1.mcp.status({
+      query: { directory: this.directory },
+    });
+
+    if (result.error || !result.data) {
+      throw new Error(`MCP status failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return Object.entries(result.data)
+      .map(([name, info]) => ({
+        name,
+        status: info.status,
+        error: 'error' in info ? info.error : undefined,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   private buildPromptBody(
     message: string,
     agent?: string,
-    model?: SelectedModel
+    model?: SelectedModel,
+    tools?: Record<string, boolean>
   ): {
     parts: Array<{ type: 'text'; text: string }>;
     agent?: string;
     model?: SelectedModel;
+    tools?: Record<string, boolean>;
   } {
     return {
       ...(agent ? { agent } : {}),
       ...(model ? { model } : {}),
+      ...(tools && Object.keys(tools).length > 0 ? { tools } : {}),
       parts: [{ type: 'text', text: message }],
     };
   }
