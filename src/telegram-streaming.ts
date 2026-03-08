@@ -7,6 +7,7 @@ export type TelegramStreamingMessenger = {
   editMessageText: (chatId: number, messageId: number, text: string, options?: any) => Promise<void>;
   sendMessageDraft: (chatId: number, draftId: number, text: string, options?: any) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
+  isMessageNotModifiedError?: (error: unknown) => boolean;
   log?: (message: string, error?: unknown) => void;
 };
 
@@ -203,6 +204,13 @@ export class TelegramStreamingReply {
       this.lastFlushedAt = Date.now();
       this.lastFlushedSourceLength = this.latestSourceText.length;
     } catch (error) {
+      if (this.messenger.isMessageNotModifiedError?.(error)) {
+        this.lastRenderedText = rendered;
+        this.lastFlushedAt = Date.now();
+        this.lastFlushedSourceLength = this.latestSourceText.length;
+        return;
+      }
+
       this.disabled = true;
       this.messenger.log?.('[stream] disabling preview updates after delivery failure', error);
     } finally {

@@ -237,9 +237,19 @@ export class TelegramBot {
       .replace(/&amp;/g, '&');
   }
 
+  private sanitizeTelegramHtml(text: string): string {
+    return text
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/?div>/gi, '\n')
+      .replace(/<\/?span>/gi, '')
+      .replace(/<code class="language-[^"]*">/gi, '<code>')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
   private stripTelegramHtml(text: string): string {
     return this.decodeBasicHtmlEntities(
-      text
+      this.sanitizeTelegramHtml(text)
         .replace(/<br\s*\/?>/g, '\n')
         .replace(/<\/p>/g, '\n\n')
         .replace(/<\/h[1-6]>/g, '\n')
@@ -327,8 +337,9 @@ export class TelegramBot {
 
   private async sendHtmlMessage(chatId: number, text: string, options: any = {}): Promise<void> {
     const { parse_mode, ...rest } = options;
+    const sanitized = this.sanitizeTelegramHtml(text);
     try {
-      await this.sendMessage(chatId, text, {
+      await this.sendMessage(chatId, sanitized, {
         ...rest,
         parse_mode: parse_mode ?? 'HTML',
       });
@@ -337,14 +348,15 @@ export class TelegramBot {
         throw error;
       }
 
-      await this.sendMessage(chatId, this.stripTelegramHtml(text), rest);
+      await this.sendMessage(chatId, this.stripTelegramHtml(sanitized), rest);
     }
   }
 
   private async editHtmlMessage(chatId: number, messageId: number, text: string, options: any = {}): Promise<void> {
     const { parse_mode, ...rest } = options;
+    const sanitized = this.sanitizeTelegramHtml(text);
     try {
-      await this.editMessageText(chatId, messageId, text, {
+      await this.editMessageText(chatId, messageId, sanitized, {
         ...rest,
         parse_mode: parse_mode ?? 'HTML',
       });
@@ -353,7 +365,7 @@ export class TelegramBot {
         throw error;
       }
 
-      await this.editMessageText(chatId, messageId, this.stripTelegramHtml(text), rest);
+      await this.editMessageText(chatId, messageId, this.stripTelegramHtml(sanitized), rest);
     }
   }
 
@@ -1779,6 +1791,7 @@ export class TelegramBot {
         editMessageText: (targetChatId, messageId, text, options) => this.editMessageText(targetChatId, messageId, text, options),
         sendMessageDraft: (targetChatId, draftId, text, options) => this.sendMessageDraft(targetChatId, draftId, text, options),
         deleteMessage: (targetChatId, messageId) => this.deleteMessage(targetChatId, messageId),
+        isMessageNotModifiedError: (error) => this.isMessageNotModifiedError(error),
         log: (message, error) => console.warn(message, error),
       },
       draftSupport: this.draftStreamingSupport,
