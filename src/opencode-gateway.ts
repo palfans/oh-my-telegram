@@ -46,6 +46,15 @@ interface OpencodeResponse {
   parts: OpencodeMessage[];
 }
 
+type GatewayMessageInfo = {
+  id?: string;
+  error?: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 export class OpencodeGateway {
   private clientV1: ReturnType<typeof createOpencodeClientV1>;
   private clientV2: ReturnType<typeof createOpencodeClientV2>;
@@ -186,11 +195,26 @@ export class OpencodeGateway {
       throw new Error('No data in response');
     }
 
-    const response = result.data as any;
+    const response = result.data;
 
-    const textParts = response.parts
-      .filter((part: OpencodeMessage) => part.type === 'text' && part.text)
-      .map((part: OpencodeMessage) => part.text!);
+    let textParts = this.extractTextParts(response);
+
+    if (textParts.length === 0) {
+      const messageId = this.extractMessageId(response);
+      if (messageId) {
+        textParts = await this.getMessageTextParts(messageId);
+      }
+    }
+
+    if (textParts.length === 0) {
+      const assistantError = this.extractAssistantError(response);
+      if (assistantError) {
+        throw new Error(`Prompt failed: ${assistantError}`);
+      }
+
+      const responseKeys = isRecord(response) ? Object.keys(response).join(', ') : typeof response;
+      throw new Error(`Prompt response contained no text parts (keys: ${responseKeys || 'none'})`);
+    }
 
     if (textParts.length === 0) {
       return '[No text response from agent]';
@@ -484,5 +508,132 @@ export class OpencodeGateway {
     if (result.error) {
       throw new Error(`Question reject failed: ${String(result.error)}`);
     }
+  }
+
+  private extractTextParts(response: unknown): string[] {
+    const parts = this.extractParts(response);
+    return parts
+      .filter((part) => part.type === 'text' && typeof part.text === 'string' && part.text.length > 0)
+      .map((part) => part.text as string);
+  }
+
+  private extractParts(response: unknown): OpencodeMessage[] {
+    if (!isRecord(response)) {
+      return [];
+    }
+
+    const directParts = this.normalizeParts(response.parts);
+    if (directParts.length > 0) {
+      return directParts;
+    }
+
+    const nestedData = response.data;
+    if (!isRecord(nestedData)) {
+      return [];
+    }
+
+    return this.normalizeParts(nestedData.parts);
+  }
+
+  private normalizeParts(parts: unknown): OpencodeMessage[] {
+    if (!Array.isArray(parts)) {
+      return [];
+    }
+
+    return parts.flatMap((part) => {
+      if (!isRecord(part) || typeof part.type !== 'string') {
+        return [];
+      }
+
+      const text = typeof part.text === 'string' ? part.text : undefined;
+      return [{ type: part.type, text } satisfies OpencodeMessage];
+    });
+  }
+
+  private extractMessageId(response: unknown): string | undefined {
+    return this.extractMessageInfo(response)?.id;
+  }
+
+  private extractAssistantError(response: unknown): string | undefined {
+    const error = this.extractMessageInfo(response)?.error;
+    return this.stringifyAssistantError(error);
+  }
+
+  private extractMessageInfo(response: unknown): GatewayMessageInfo | undefined {
+    if (!isRecord(response)) {
+      return undefined;
+    }
+
+    const directInfo = response.info;
+    if (isRecord(directInfo)) {
+      return directInfo;
+    }
+
+    const nestedData = response.data;
+    if (!isRecord(nestedData)) {
+      return undefined;
+    }
+
+    return isRecord(nestedData.info) ? nestedData.info : undefined;
+  }
+
+  private stringifyAssistantError(error: unknown): string | undefined {
+    if (typeof error === 'string' && error.length > 0) {
+      return error;
+    }
+
+    if (!isRecord(error)) {
+      return undefined;
+    }
+
+    const message = error.message;
+    if (typeof message === 'string' && message.length > 0) {
+      return message;
+    }
+
+    const responseBody = error.responseBody;
+    if (typeof responseBody === 'string' && responseBody.length > 0) {
+      return responseBody;
+    }
+
+    const errorName = error.name;
+    const data = error.data;
+    const dataString = isRecord(data) ? JSON.stringify(data) : undefined;
+
+    if (typeof errorName === 'string' && dataString) {
+      return `${errorName}: ${dataString}`;
+    }
+
+    if (typeof errorName === 'string' && errorName.length > 0) {
+      return errorName;
+    }
+
+    return JSON.stringify(error);
+  }
+
+  private async getMessageTextParts(messageID: string): Promise<string[]> {
+    if (!this.sessionId) {
+      return [];
+    }
+
+    const result = await this.clientV1.session.message({
+      path: { id: this.sessionId, messageID },
+    });
+
+    if (result.error || !result.data) {
+      return [];
+    }
+
+    const textParts = this.extractTextParts(result.data);
+    if (textParts.length > 0) {
+      return textParts;
+    }
+
+    const assistantError = this.extractAssistantError(result.data);
+    if (assistantError) {
+      throw new Error(`Prompt failed: ${assistantError}`);
+    }
+
+    return [];
   }
 }
