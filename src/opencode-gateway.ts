@@ -32,6 +32,13 @@ export type PendingQuestionRequest = {
   };
 };
 
+export type OpencodeStreamOptions = {
+  agent?: string;
+  onText?: (text: string) => void | Promise<void>;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+};
+
 interface OpencodeMessage {
   type: string;
   text?: string;
@@ -49,6 +56,17 @@ interface OpencodeResponse {
 type GatewayMessageInfo = {
   id?: string;
   error?: unknown;
+  role?: string;
+  parentID?: string;
+  time?: {
+    created?: number;
+    completed?: number;
+  };
+};
+
+type SessionMessageEntry = {
+  info?: GatewayMessageInfo;
+  parts?: unknown;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,7 +188,7 @@ export class OpencodeGateway {
     console.log(`[OpencodeGateway] Created new session: ${this.sessionId}`);
   }
 
-  async sendMessage(message: string): Promise<string> {
+  async sendMessage(message: string, agent?: string): Promise<string> {
     if (!this.sessionId) {
       await this.initialize();
       if (!this.sessionId) {
@@ -182,9 +200,7 @@ export class OpencodeGateway {
 
     const result = await this.clientV1.session.prompt({
       path: { id: this.sessionId },
-      body: {
-        parts: [{ type: 'text', text: message }],
-      },
+      body: this.buildPromptBody(message, agent),
     });
 
     if (result.error) {
@@ -224,6 +240,87 @@ export class OpencodeGateway {
     console.log(`[OpencodeGateway] Received response (${fullResponse.length} chars)`);
 
     return fullResponse;
+  }
+
+  async streamMessage(message: string, options: OpencodeStreamOptions = {}): Promise<string> {
+    if (!this.sessionId) {
+      await this.initialize();
+      if (!this.sessionId) {
+        throw new Error('Gateway not initialized. Call initialize() first.');
+      }
+    }
+
+    const pollIntervalMs = options.pollIntervalMs ?? 700;
+    const timeoutMs = options.timeoutMs ?? 10 * 60 * 1000;
+    const startedAt = Date.now();
+
+    console.log(`[OpencodeGateway] Streaming message to session ${this.sessionId}...`);
+
+    const accepted = await this.clientV1.session.promptAsync({
+      path: { id: this.sessionId },
+      body: this.buildPromptBody(message, options.agent),
+    });
+
+    if (accepted.error) {
+      console.warn(`[OpencodeGateway] promptAsync failed, falling back to prompt(): ${String(accepted.error)}`);
+      return this.sendMessage(message, options.agent);
+    }
+
+    let lastText = '';
+    let userMessageId: string | undefined;
+    let consecutiveErrors = 0;
+    const deadline = startedAt + timeoutMs;
+
+    while (Date.now() < deadline) {
+      let messages: SessionMessageEntry[];
+      try {
+        messages = await this.listSessionMessages();
+        consecutiveErrors = 0;
+      } catch (error) {
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 5) {
+          throw error;
+        }
+
+        await this.sleep(pollIntervalMs);
+        continue;
+      }
+
+      const snapshot = this.selectStreamingSnapshot(messages, startedAt, userMessageId);
+
+      if (snapshot.user?.info?.id) {
+        userMessageId = snapshot.user.info.id;
+      }
+
+      if (!snapshot.assistant) {
+        await this.sleep(pollIntervalMs);
+        continue;
+      }
+
+      const assistantText = this.extractTextParts(snapshot.assistant).join('\n');
+      if (assistantText && assistantText !== lastText) {
+        lastText = assistantText;
+        await options.onText?.(assistantText);
+      }
+
+      const assistantError = this.extractAssistantError(snapshot.assistant);
+      if (assistantError) {
+        throw new Error(`Prompt failed: ${assistantError}`);
+      }
+
+      if (this.isMessageCompleted(snapshot.assistant)) {
+        if (assistantText) {
+          console.log(`[OpencodeGateway] Stream completed (${assistantText.length} chars)`);
+          return assistantText;
+        }
+
+        return '[No text response from agent]';
+      }
+
+      await this.sleep(pollIntervalMs);
+    }
+
+    throw new Error(`Timed out waiting for streamed response after ${timeoutMs}ms`);
   }
 
   getSessionId(): string | null {
@@ -508,6 +605,70 @@ export class OpencodeGateway {
     if (result.error) {
       throw new Error(`Question reject failed: ${String(result.error)}`);
     }
+  }
+
+  private buildPromptBody(message: string, agent?: string): { parts: Array<{ type: 'text'; text: string }>; agent?: string } {
+    return {
+      ...(agent ? { agent } : {}),
+      parts: [{ type: 'text', text: message }],
+    };
+  }
+
+  private async listSessionMessages(): Promise<SessionMessageEntry[]> {
+    if (!this.sessionId) {
+      return [];
+    }
+
+    const result = await this.clientV1.session.messages({
+      path: { id: this.sessionId },
+    });
+
+    if (result.error || !Array.isArray(result.data)) {
+      throw new Error(`Session messages failed: ${result.error ? String(result.error) : 'unknown error'}`);
+    }
+
+    return result.data as SessionMessageEntry[];
+  }
+
+  private selectStreamingSnapshot(
+    messages: SessionMessageEntry[],
+    startedAt: number,
+    userMessageId?: string
+  ): { user?: SessionMessageEntry; assistant?: SessionMessageEntry } {
+    const recentMessages = messages.filter((entry) => {
+      const createdAt = this.getMessageCreatedAt(entry);
+      return typeof createdAt === 'number' && createdAt >= startedAt - 2000;
+    });
+
+    const users = recentMessages
+      .filter((entry) => entry.info?.role === 'user')
+      .sort((a, b) => (this.getMessageCreatedAt(b) || 0) - (this.getMessageCreatedAt(a) || 0));
+
+    const user = (userMessageId
+      ? users.find((entry) => entry.info?.id === userMessageId)
+      : undefined) || users[0];
+
+    const assistants = recentMessages
+      .filter((entry) => entry.info?.role === 'assistant')
+      .sort((a, b) => (this.getMessageCreatedAt(b) || 0) - (this.getMessageCreatedAt(a) || 0));
+
+    const assistant = (user?.info?.id
+      ? assistants.find((entry) => entry.info?.parentID === user.info?.id)
+      : undefined) || assistants[0];
+
+    return { user, assistant };
+  }
+
+  private getMessageCreatedAt(entry: SessionMessageEntry): number | undefined {
+    return entry.info?.time?.created;
+  }
+
+  private isMessageCompleted(entry: SessionMessageEntry): boolean {
+    return typeof entry.info?.time?.completed === 'number';
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   private extractTextParts(response: unknown): string[] {
